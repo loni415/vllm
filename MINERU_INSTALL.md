@@ -205,7 +205,28 @@ This script is designed to work alongside the vLLM installation scripts:
 - `setup3.sh`: Installs vLLM in `vllm/` venv
 - `install_mineru.sh`: Creates separate `mineru/` venv for MinerU
 
-The separate virtual environments prevent dependency conflicts.
+The separate virtual environments prevent dependency conflicts (Recommended).
+
+### Combined Installation (Advanced)
+
+If you need to run MinerU and vLLM in the same Python process, you can attempt to install MinerU into the existing vLLM virtual environment.
+
+**Warning**: This may cause dependency conflicts. The installation script attempts to protect critical vLLM packages (like `torch`, `vllm`, and `opencv`) by pinning them to their current versions. If MinerU requires incompatible versions, the installation will fail with an error to prevent breaking your vLLM setup.
+
+To attempt a combined install, run the dedicated integration script after completing setup 1-3:
+
+```bash
+./setup4_mineru_into_vllm.sh
+```
+
+Or manually:
+
+```bash
+# Install into the 'vllm' directory created by setup1.sh
+MINERU_VENV_DIR="vllm" ./install_mineru.sh
+```
+
+If this fails due to version conflicts, you should stick to the separate environment approach.
 
 ## References
 
