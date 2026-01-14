@@ -213,7 +213,13 @@ If you need to run MinerU and vLLM in the same Python process, you can attempt t
 
 **Warning**: This may cause dependency conflicts. The installation script attempts to protect critical vLLM packages (like `torch`, `vllm`, and `opencv`) by pinning them to their current versions. If MinerU requires incompatible versions, the installation will fail with an error to prevent breaking your vLLM setup.
 
-To attempt a combined install:
+To attempt a combined install, run the dedicated integration script after completing setup 1-3:
+
+```bash
+./setup4_mineru_into_vllm.sh
+```
+
+Or manually:
 
 ```bash
 # Install into the 'vllm' directory created by setup1.sh
