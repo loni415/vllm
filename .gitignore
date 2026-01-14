@@ -145,6 +145,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+mineru/
+
+# MinerU installation log
+mineru_install.log
 
 # Spyder project settings
 .spyderproject
