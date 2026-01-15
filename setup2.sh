@@ -49,11 +49,11 @@ fi
 # -----------------------------------------------------------------------------
 echo "[3/5] Activating Python virtual environment..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/vllm"
+VENV_DIR="${SCRIPT_DIR}/mineru"
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "ERROR: Virtual environment not found at: $VENV_DIR"
-  echo "Run Task 1 in the same directory as this script (so it creates ./vllm)."
+  echo "Run Task 1 in the same directory as this script (so it creates ./mineru)."
   exit 1
 fi
 

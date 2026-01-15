@@ -78,7 +78,7 @@ echo "✓ Compiler toolchain verified"
 #    Creates ./vllm in the *current directory* (not $HOME), per your desired pattern
 # -----------------------------------------------------------------------------
 echo "[5/6] Creating Python virtual environment with uv..."
-VENV_DIR="vllm"
+VENV_DIR="mineru"
 
 # Ensure uv exists (install to user-space if missing)
 if ! command -v uv >/dev/null 2>&1; then

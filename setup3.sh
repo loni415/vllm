@@ -79,7 +79,7 @@ echo "VLLM_TORCH_COMPILE_CACHE_DIR = $VLLM_TORCH_COMPILE_CACHE_DIR"
 # -----------------------------------------------------------------------------
 echo "[3/6] Activating Python virtual environment..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/vllm"
+VENV_DIR="${SCRIPT_DIR}/mineru"
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "ERROR: Virtual environment not found at: $VENV_DIR"
