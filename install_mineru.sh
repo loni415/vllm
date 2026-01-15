@@ -2,8 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="mineru"
-VENV_PATH="${SCRIPT_DIR}/${VENV_DIR}"
+VENV_DIR="${MINERU_VENV_DIR:-mineru}"
+
+if [[ "$VENV_DIR" = /* ]]; then
+  VENV_PATH="$VENV_DIR"
+else
+  VENV_PATH="${SCRIPT_DIR}/${VENV_DIR}"
+fi
+
 LOG_FILE="${SCRIPT_DIR}/mineru_install.log"
 
 # Optional: install OS packages (requires sudo)
@@ -68,9 +74,9 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# [3/6] Create virtual environment named 'mineru'
+# [3/6] Create virtual environment
 # -----------------------------------------------------------------------------
-echo "[3/6] Creating virtual environment '${VENV_DIR}'..."
+echo "[3/6] Configuring virtual environment at '${VENV_PATH}'..."
 
 if [ -d "$VENV_PATH" ] && [ "$MINERU_VENV_RECREATE" = "1" ]; then
   echo "  Recreating existing venv at: $VENV_PATH"
@@ -119,10 +125,51 @@ python -m pip install --upgrade pip setuptools wheel
 echo "[5/6] Installing MinerU (pip spec: ${MINERU_PIP_SPEC})..."
 echo "  Logging to: $LOG_FILE"
 
+# Detect existing critical packages (e.g., if installing into vLLM venv) and pin them.
+CONSTRAINTS_FILE="${SCRIPT_DIR}/mineru_constraints.txt"
+rm -f "$CONSTRAINTS_FILE"
+
+echo "  Checking for existing critical dependencies to protect..."
+python - <<PYEOF
+import sys
+import importlib.metadata
+
+critical = [
+    "torch", "torchvision", "torchaudio",
+    "vllm",
+    "opencv-python", "opencv-python-headless",
+    "numpy"
+]
+
+found = []
+for pkg in critical:
+    try:
+        ver = importlib.metadata.version(pkg)
+        found.append(f"{pkg}=={ver}")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
+if found:
+    with open("$CONSTRAINTS_FILE", "w") as f:
+        f.write("\n".join(found) + "\n")
+    print("  ✓ Found existing critical packages (pinned in constraints.txt):")
+    for item in found:
+        print(f"    - {item}")
+else:
+    print("  (No critical packages found in current venv; clean install safe)")
+PYEOF
+
+PIP_ARGS=""
+if [ -f "$CONSTRAINTS_FILE" ]; then
+  PIP_ARGS="-c $CONSTRAINTS_FILE"
+fi
+
 # `[...]` extras must be quoted to avoid shell globbing.
 # If MinerU wheels are not available for Python 3.13 yet, consider using Python 3.11/3.12.
-python -m pip install --upgrade "${MINERU_PIP_SPEC}" 2>&1 | tee "$LOG_FILE"
+# shellcheck disable=SC2086
+python -m pip install --upgrade "${MINERU_PIP_SPEC}" $PIP_ARGS 2>&1 | tee "$LOG_FILE"
 
+rm -f "$CONSTRAINTS_FILE"
 echo "✓ MinerU install step finished"
 
 # -----------------------------------------------------------------------------
