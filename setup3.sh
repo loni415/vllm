@@ -53,26 +53,51 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Define scratch base ONCE
+# 2.5) Configure cache directories (HPC vs Personal)
 # -----------------------------------------------------------------------------
-SCRATCH_BASE="/scratch/$USER"
+echo "[2.5/6] Configuring cache directories..."
 
-# -----------------------------------------------------------------------------
-# 2.5) Redirect ALL caches to scratch (CRITICAL on HPC)
-# -----------------------------------------------------------------------------
-echo "[2.5/6] Redirecting caches to scratch..."
+# Check for HPC environment (existence of /scratch)
+if [ -d "/scratch" ] || [ "${FORCE_HPC_LAYOUT:-0}" = "1" ]; then
+  echo "  HPC environment detected (found /scratch or FORCE_HPC_LAYOUT=1). Redirecting caches to /scratch/$USER..."
+  CACHE_ROOT="/scratch/$USER"
 
-# -----------------------------------------------------------------------------
-# CRITICAL: Redirect all caches off $HOME (must be set before any Python runs)
-# -----------------------------------------------------------------------------
+  # HPC Strategy: Keep everything under /scratch/$USER to avoid $HOME quota issues
+  export XDG_CACHE_HOME="$CACHE_ROOT/.cache"
+  export VLLM_TORCH_COMPILE_CACHE_DIR="$CACHE_ROOT/vllm_torch_compile"
 
-export XDG_CACHE_HOME="$SCRATCH_BASE/.cache"
-export VLLM_TORCH_COMPILE_CACHE_DIR="$SCRATCH_BASE/vllm_torch_compile"
+  export HF_HOME="$CACHE_ROOT/hf"
+  export TORCH_HOME="$CACHE_ROOT/torch"
+  export TORCH_CACHE_DIR="$TORCH_HOME"
+  export VLLM_CACHE_DIR="$CACHE_ROOT/vllm"
+  export TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/torch_inductor"
 
-mkdir -p "$XDG_CACHE_HOME" "$VLLM_TORCH_COMPILE_CACHE_DIR"
+else
+  echo "  Personal/Standard environment detected. Using $HOME/.cache..."
 
-echo "XDG_CACHE_HOME = $XDG_CACHE_HOME"
-echo "VLLM_TORCH_COMPILE_CACHE_DIR = $VLLM_TORCH_COMPILE_CACHE_DIR"
+  # Personal Strategy: Use standard XDG locations
+  export XDG_CACHE_HOME="$HOME/.cache"
+  export VLLM_TORCH_COMPILE_CACHE_DIR="$XDG_CACHE_HOME/vllm_torch_compile"
+
+  export HF_HOME="$XDG_CACHE_HOME/huggingface"
+  export TORCH_HOME="$XDG_CACHE_HOME/torch"
+  export TORCH_CACHE_DIR="$TORCH_HOME"
+  export VLLM_CACHE_DIR="$XDG_CACHE_HOME/vllm"
+  export TORCHINDUCTOR_CACHE_DIR="$XDG_CACHE_HOME/torch_inductor"
+fi
+
+# Derived variables and aliases
+export HF_HUB_CACHE="$HF_HOME/hub"
+export TORCH_COMPILE_CACHE_DIR="$VLLM_TORCH_COMPILE_CACHE_DIR"
+
+# Create all cache directories now
+mkdir -p "$XDG_CACHE_HOME" "$VLLM_TORCH_COMPILE_CACHE_DIR" \
+         "$HF_HOME" "$HF_HUB_CACHE" \
+         "$TORCH_HOME" "$VLLM_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
+
+echo "  XDG_CACHE_HOME: $XDG_CACHE_HOME"
+echo "  HF_HOME:        $HF_HOME"
+echo "  TORCH_HOME:     $TORCH_HOME"
 
 # -----------------------------------------------------------------------------
 # 3) Activate the venv from Tasks 1 & 2 (./vllm next to this script)
@@ -142,41 +167,12 @@ echo "✓ Optional dependencies installed"
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# Hugging Face / vLLM cache (cluster-specific scratch)
+# Hugging Face / vLLM cache (configured in Section 2.5)
 # -----------------------------------------------------------------------------
-HF_DIR="/scratch/$USER/hf"
-mkdir -p "$HF_DIR" "$HF_DIR/hub" "$HF_DIR/vllm"
-
-export HF_HOME="$HF_DIR"
-export HF_HUB_CACHE="$HF_HOME/hub"
-# export VLLM_CACHE_DIR="$HF_HOME/vllm"
-# export HF_HUB_ENABLE_HF_TRANSFER=1
-
 echo "HF cache directory: $HF_HOME"
-
-# -----------------------------------------------------------------------------
-# Torch / vLLM compilation caches (MUST be on scratch on HPC)
-# -----------------------------------------------------------------------------
-TORCH_CACHE_DIR="$SCRATCH_BASE/torch"
-VLLM_CACHE_DIR="$SCRATCH_BASE/vllm"
-INDUCTOR_CACHE_DIR="$SCRATCH_BASE/torch_inductor"
-
-mkdir -p "$TORCH_CACHE_DIR" "$VLLM_CACHE_DIR" "$INDUCTOR_CACHE_DIR"
-
-# Torch / Dynamo / Inductor
-export TORCH_HOME="$TORCH_CACHE_DIR"
-export TORCHINDUCTOR_CACHE_DIR="$INDUCTOR_CACHE_DIR"
-export TORCH_COMPILE_CACHE_DIR="$VLLM_TORCH_COMPILE_CACHE_DIR"
-
-# vLLM Torch compile cache (Inductor / Triton)
-export VLLM_TORCH_COMPILE_CACHE_DIR="$SCRATCH_BASE/vllm_torch_compile"
-
-# vLLM compile + runtime cache
-export VLLM_CACHE_DIR="$SCRATCH_BASE/vllm"
-
 echo "Torch cache:        $TORCH_CACHE_DIR"
-echo "TorchInductor:     $INDUCTOR_CACHE_DIR"
-echo "vLLM cache:        $VLLM_CACHE_DIR"
+echo "TorchInductor:      $TORCHINDUCTOR_CACHE_DIR"
+echo "vLLM cache:         $VLLM_CACHE_DIR"
 
 echo "[6/6] Verifying vLLM installation..."
 python - <<'PY'
