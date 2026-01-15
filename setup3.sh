@@ -175,6 +175,8 @@ echo "TorchInductor:      $TORCHINDUCTOR_CACHE_DIR"
 echo "vLLM cache:         $VLLM_CACHE_DIR"
 
 echo "[6/6] Verifying vLLM installation..."
+# Change to HOME to avoid picking up local 'vllm/' folder if running from source root without editable install
+cd "$HOME"
 python - <<'PY'
 import sys, torch
 import vllm
