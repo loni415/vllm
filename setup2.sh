@@ -9,10 +9,14 @@ echo "=============================================="
 # 1) Load modules
 # -----------------------------------------------------------------------------
 echo "[1/5] Loading modules..."
-module purge
-module load miniforge/24.3.0-py3.11
-module load cuda/12.8.0
-echo "✓ Modules loaded"
+if command -v module >/dev/null 2>&1; then
+  module purge
+  module load miniforge/24.3.0-py3.11
+  module load cuda/12.8.0
+  echo "✓ Modules loaded"
+else
+  echo "⚠ 'module' command not found. Assuming non-HPC environment."
+fi
 
 # -----------------------------------------------------------------------------
 # 2) CUDA environment variables (prefer module-provided; fallback to nvcc-derived)
@@ -26,16 +30,19 @@ elif [ -n "${CUDA_PATH:-}" ] && [ -d "${CUDA_PATH}" ]; then
 elif command -v nvcc >/dev/null 2>&1; then
   export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
 else
-  echo "ERROR: nvcc not found; cuda/12.8.0 module may not be available on this node."
-  exit 1
+  echo "WARNING: nvcc not found."
+  CUDA_HOME=""
 fi
 
-export CUDA_PATH="$CUDA_HOME"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-
-echo "CUDA_HOME = $CUDA_HOME"
-nvcc --version | sed -n '1,5p'
+if [ -n "$CUDA_HOME" ]; then
+  export CUDA_PATH="$CUDA_HOME"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  echo "CUDA_HOME = $CUDA_HOME"
+  nvcc --version | sed -n '1,5p'
+else
+  echo "CUDA_HOME not set. Skipping CUDA env exports."
+fi
 
 # -----------------------------------------------------------------------------
 # 3) Activate the Task 1 uv venv (assumes ./vllm exists next to this script)

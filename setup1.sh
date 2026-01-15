@@ -9,10 +9,15 @@ echo "=============================================="
 # 1) Load modules (CUDA 12.8.0 + Python 3.11 via miniforge)
 # -----------------------------------------------------------------------------
 echo "[1/6] Loading modules..."
-module purge
-module load miniforge/24.3.0-py3.11
-module load cuda/12.8.0
-echo "✓ Modules loaded"
+if command -v module >/dev/null 2>&1; then
+  module purge
+  module load miniforge/24.3.0-py3.11
+  module load cuda/12.8.0
+  echo "✓ Modules loaded"
+else
+  echo "⚠ 'module' command not found. Assuming non-HPC environment."
+  echo "  Ensure Python 3.11+ and CUDA libraries are available."
+fi
 
 # -----------------------------------------------------------------------------
 # 2) Set CUDA environment variables (prefer module-provided CUDA; fallback if needed)
@@ -32,23 +37,32 @@ else
   elif command -v nvcc >/dev/null 2>&1; then
     export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
   else
-    echo "ERROR: nvcc not found and no CUDA_HOME/CUDA_PATH set. Is cuda/12.8.0 module correct?"
-    exit 1
+    echo "WARNING: nvcc not found and no CUDA_HOME/CUDA_PATH set."
+    echo "  Proceeding assuming pre-built wheels will be used (which don't require nvcc)."
+    # Fallback to empty or system default
+    CUDA_HOME=""
   fi
 fi
 
-export CUDA_PATH="$CUDA_HOME"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-
-echo "CUDA_HOME = $CUDA_HOME"
+if [ -n "$CUDA_HOME" ]; then
+  export CUDA_PATH="$CUDA_HOME"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  echo "CUDA_HOME = $CUDA_HOME"
+else
+  echo "CUDA_HOME not set (nvcc missing). Skipping CUDA env exports."
+fi
 
 # -----------------------------------------------------------------------------
 # 3) Verify CUDA installation
 # -----------------------------------------------------------------------------
 echo "[3/6] Verifying CUDA..."
-nvcc --version
-echo "✓ CUDA verified"
+if command -v nvcc >/dev/null 2>&1; then
+  nvcc --version
+  echo "✓ CUDA verified"
+else
+  echo "⚠ nvcc not found (skipping verification)"
+fi
 
 # -----------------------------------------------------------------------------
 # 4) Verify compiler toolchain

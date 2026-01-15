@@ -12,10 +12,14 @@ echo "=============================================="
 # 1) Load modules (consistent with Tasks 1 & 2)
 # -----------------------------------------------------------------------------
 echo "[1/6] Loading modules..."
-module purge
-module load miniforge/24.3.0-py3.11
-module load cuda/12.8.0
-echo "✓ Modules loaded"
+if command -v module >/dev/null 2>&1; then
+  module purge
+  module load miniforge/24.3.0-py3.11
+  module load cuda/12.8.0
+  echo "✓ Modules loaded"
+else
+  echo "⚠ 'module' command not found. Assuming non-HPC environment."
+fi
 
 # -----------------------------------------------------------------------------
 # 2) Set CUDA environment variables (trust module first; fallback to nvcc/candidate)
@@ -33,17 +37,20 @@ else
   if [ -d "$CANDIDATE" ]; then
     export CUDA_HOME="$CANDIDATE"
   else
-    echo "ERROR: nvcc not found and no CUDA_HOME/CUDA_PATH set."
-    exit 1
+    echo "WARNING: nvcc not found and no CUDA_HOME/CUDA_PATH set."
+    CUDA_HOME=""
   fi
 fi
 
-export CUDA_PATH="$CUDA_HOME"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-
-echo "CUDA_HOME = $CUDA_HOME"
-nvcc --version | sed -n '1,2p'
+if [ -n "$CUDA_HOME" ]; then
+  export CUDA_PATH="$CUDA_HOME"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  echo "CUDA_HOME = $CUDA_HOME"
+  nvcc --version | sed -n '1,2p'
+else
+  echo "CUDA_HOME not set. Skipping CUDA env exports."
+fi
 
 # -----------------------------------------------------------------------------
 # Define scratch base ONCE
