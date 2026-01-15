@@ -109,6 +109,45 @@ python -m pip install -U pip setuptools wheel
 echo "✓ pip upgraded"
 
 # -----------------------------------------------------------------------------
+# 6.5) Verify Python version and Fix for GCC 15+ incompatibility
+# -----------------------------------------------------------------------------
+
+# Verify Python version
+PY_VER=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "Checking Python version in venv: $PY_VER"
+if [[ "$PY_VER" != "3.11" ]]; then
+    echo "WARNING: Python version is $PY_VER, but 3.11 was requested."
+    echo "This might cause issues with vLLM pre-built wheels."
+fi
+
+# Fix for GCC 15 incompatibility (Force nvcc to use gcc-12)
+# Check system GCC version
+SYS_GCC_VER=$(gcc -dumpversion | cut -d. -f1)
+echo "Checking system GCC version: $SYS_GCC_VER"
+
+if [ "$SYS_GCC_VER" -ge 15 ]; then
+    echo "System GCC is version $SYS_GCC_VER (too new for CUDA 12.8)."
+    if [ -f "/usr/bin/gcc-12" ]; then
+        echo "Configuring NVCC to use gcc-12..."
+        export NVCC_CCBIN="/usr/bin/gcc-12"
+        
+        # Persist in activate script if not already present
+        if ! grep -q "NVCC_CCBIN" "$VENV_DIR/bin/activate"; then
+            echo "" >> "$VENV_DIR/bin/activate"
+            echo "# Fix for GCC 15+ incompatibility with CUDA 12.8" >> "$VENV_DIR/bin/activate"
+            echo "export NVCC_CCBIN=/usr/bin/gcc-12" >> "$VENV_DIR/bin/activate"
+            echo "Added NVCC_CCBIN export to activate script."
+        else
+             echo "NVCC_CCBIN export already present in activate script."
+        fi
+    else
+        echo "WARNING: gcc-12 not found. You may encounter JIT compilation errors in Task 3."
+    fi
+else
+    echo "System GCC version $SYS_GCC_VER is supported."
+fi
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo ""

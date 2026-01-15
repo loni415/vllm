@@ -6,7 +6,7 @@ echo "MinerU Integration with vLLM - Task 4"
 echo "=============================================="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VLLM_VENV_DIR="vllm"
+VLLM_VENV_DIR="mineru"
 VLLM_VENV_PATH="${SCRIPT_DIR}/${VLLM_VENV_DIR}"
 
 # -----------------------------------------------------------------------------
@@ -28,6 +28,24 @@ fi
 echo "✓ Found vLLM venv at: $VLLM_VENV_PATH"
 
 # -----------------------------------------------------------------------------
+# 1.5) Fix for GCC 15 incompatibility (Force nvcc to use gcc-12)
+# -----------------------------------------------------------------------------
+if [ -f "/usr/bin/gcc-12" ]; then
+    echo "Configuring NVCC to use gcc-12..."
+    export NVCC_CCBIN="/usr/bin/gcc-12"
+    
+    # Persist in activate script if not already present
+    if ! grep -q "NVCC_CCBIN" "$VLLM_VENV_PATH/bin/activate"; then
+        echo "" >> "$VLLM_VENV_PATH/bin/activate"
+        echo "# Fix for GCC 15+ incompatibility with CUDA 12.8" >> "$VLLM_VENV_PATH/bin/activate"
+        echo "export NVCC_CCBIN=/usr/bin/gcc-12" >> "$VLLM_VENV_PATH/bin/activate"
+        echo "Added NVCC_CCBIN export to activate script."
+    fi
+else
+    echo "WARNING: gcc-12 not found. You may encounter JIT compilation errors if system GCC is > 14."
+fi
+
+# -----------------------------------------------------------------------------
 # 2) Run MinerU Installation targeting the vLLM venv
 # -----------------------------------------------------------------------------
 echo "[2/2] Installing MinerU into vLLM environment..."
@@ -46,5 +64,5 @@ echo "Task 4 Complete"
 echo "=============================================="
 echo "MinerU has been installed into the vLLM environment."
 echo "You can now run vLLM and MinerU in the same process."
-echo "Activate with: source vllm/bin/activate"
+echo "Activate with: source ${VLLM_VENV_DIR}/bin/activate"
 echo "=============================================="
