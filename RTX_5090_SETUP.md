@@ -1,12 +1,15 @@
 # RTX 5090 (Blackwell) Setup Guide for vLLM
 
 ## Compatibility Verification
+
 Based on the analysis of `docker/Dockerfile` and `requirements/cuda.txt`:
+
 - **CUDA Version:** 12.9.1 (Compatible with Blackwell)
 - **Compute Capability:** 12.0 (Native Blackwell support)
 - **PyTorch Version:** 2.9.1 (Cutting-edge support)
 
 ## Recommended Docker Command
+
 Run the following command to start vLLM on your RTX 5090.
 **Note:** `--enforce-eager` is removed to enable CUDA Graphs for better performance.
 
@@ -26,17 +29,20 @@ vllm/vllm-openai:latest \
 ```
 
 ## Stopping the Container
+
 To stop the running container:
 
-1.  Find the CONTAINER ID or NAME:
-    ```bash
-    sudo docker ps
-    ```
-2.  Stop the container gracefully:
-    ```bash
-    sudo docker stop <CONTAINER_ID_OR_NAME>
-    ```
+1. Find the CONTAINER ID or NAME:
+   ```bash
+   sudo docker ps
+   ```
+
+2. Stop the container gracefully:
+   ```bash
+   sudo docker stop <CONTAINER_ID_OR_NAME>
+   ```
 
 ## Notes
+
 - **Image:** `vllm/vllm-openai:latest` automatically pulls the correct image.
 - **Drivers:** Ensure NVIDIA drivers (580.x+) and Container Toolkit are installed on the host.
