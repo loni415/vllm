@@ -25,6 +25,18 @@ vllm/vllm-openai:latest \
 --quantization awq
 ```
 
+## Stopping the Container
+To stop the running container:
+
+1.  Find the CONTAINER ID or NAME:
+    ```bash
+    sudo docker ps
+    ```
+2.  Stop the container gracefully:
+    ```bash
+    sudo docker stop <CONTAINER_ID_OR_NAME>
+    ```
+
 ## Notes
 - **Image:** `vllm/vllm-openai:latest` automatically pulls the correct image.
 - **Drivers:** Ensure NVIDIA drivers (580.x+) and Container Toolkit are installed on the host.
