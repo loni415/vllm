@@ -1,20 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+import hashlib
 import pickle
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 import torch
-from blake3 import blake3
 from PIL import Image
 
+from vllm.config.multimodal import MMHasherAlgorithm
 from vllm.logger import init_logger
 
 from .media import MediaWithBytes
 
 logger = init_logger(__name__)
+
+
+@functools.lru_cache(maxsize=3)
+def _get_hasher_factory(
+    algorithm: MMHasherAlgorithm,
+) -> Callable[[], "hashlib._Hash"]:
+    """
+    Get the hasher factory based on the configured algorithm.
+
+    Args:
+        algorithm: Hash algorithm name (blake3, sha256, or sha512)
+
+    Returns a callable that creates a new hasher instance.
+    Supports blake3 (default), sha256, and sha512 for FIPS compliance.
+
+    See: https://github.com/vllm-project/vllm/issues/18334
+    """
+
+    if algorithm == "blake3":
+        from blake3 import blake3
+
+        return blake3
+    elif algorithm == "sha256":
+        return hashlib.sha256
+    elif algorithm == "sha512":
+        return hashlib.sha512
+    else:
+        # This should never happen due to config validation
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}")
 
 
 class MultiModalHasher:
@@ -51,7 +82,18 @@ class MultiModalHasher:
             ):
                 return (exif[Image.ExifTags.Base.ImageID].bytes,)
 
+            if obj.io_config:
+                return cls.iter_item_to_bytes(
+                    "image",
+                    {"io_config": obj.io_config, "data": obj.original_bytes},
+                )
             return cls.iter_item_to_bytes("image", obj.original_bytes)
+
+        if isinstance(obj, MediaWithBytes) and isinstance(obj.media, np.ndarray):
+            frames = obj.media
+            if frames.nbytes < len(obj.original_bytes):
+                return cls.iter_item_to_bytes("video", frames)
+            return cls.iter_item_to_bytes("video", obj.original_bytes)
 
         if isinstance(obj, torch.Tensor):
             tensor_obj: torch.Tensor = obj.cpu()
@@ -72,12 +114,19 @@ class MultiModalHasher:
                         "data": tensor_obj.numpy(),
                     },
                 )
+
             return cls.iter_item_to_bytes("tensor", tensor_obj.numpy())
+
         if isinstance(obj, np.ndarray):
-            # If the array is non-contiguous, we need to copy it first
-            arr_data = (
-                obj.view(np.uint8).data if obj.flags.c_contiguous else obj.tobytes()
-            )
+            if obj.ndim == 0:
+                arr_data = obj.item()
+            elif obj.flags.c_contiguous:
+                # Not valid for 0-D arrays
+                arr_data = obj.view(np.uint8).data
+            else:
+                # If the array is non-contiguous, we need to copy it first
+                arr_data = obj.tobytes()
+
             return cls.iter_item_to_bytes(
                 "ndarray",
                 {
@@ -86,6 +135,7 @@ class MultiModalHasher:
                     "data": arr_data,
                 },
             )
+
         logger.warning(
             "No serialization method found for %s. Falling back to pickle.", type(obj)
         )
@@ -113,10 +163,16 @@ class MultiModalHasher:
             yield from cls.serialize_item(obj)
 
     @classmethod
-    def hash_kwargs(cls, **kwargs: object) -> str:
-        hasher = blake3()
+    def hash_kwargs(
+        cls,
+        algorithm: MMHasherAlgorithm,
+        /,
+        **kwargs: object,
+    ) -> str:
+        hasher_factory = _get_hasher_factory(algorithm)
+        hasher = hasher_factory()
 
-        for k, v in kwargs.items():
+        for k, v in sorted(kwargs.items(), key=lambda kv: kv[0]):
             for bytes_ in cls.iter_item_to_bytes(k, v):
                 hasher.update(bytes_)
 

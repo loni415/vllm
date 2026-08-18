@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, overload
 
 import torch
 import torch.nn as nn
@@ -14,12 +15,36 @@ if TYPE_CHECKING:
 
 
 class BaseLayerWithLoRA(nn.Module):
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """Load checkpoint weights into the wrapped base layer."""
+        base_load_weights = getattr(self.base_layer, "load_weights", None)
+        if callable(base_load_weights):
+            return base_load_weights(weights)
+
+        from vllm.model_executor.models.utils import AutoWeightsLoader
+
+        return AutoWeightsLoader(self.base_layer).load_weights(weights)
+
+    @overload
+    def slice_lora_a(
+        self, lora_a: list[torch.Tensor | None]
+    ) -> list[torch.Tensor | None]: ...
+    @overload
+    def slice_lora_a(self, lora_a: torch.Tensor) -> torch.Tensor: ...
     def slice_lora_a(
         self, lora_a: torch.Tensor | list[torch.Tensor | None]
     ) -> torch.Tensor | list[torch.Tensor | None]:
         """Slice lora a if splitting for tensor parallelism."""
         ...
 
+    @overload
+    def slice_lora_b(
+        self, lora_b: list[torch.Tensor | None]
+    ) -> list[torch.Tensor | None]: ...
+    @overload
+    def slice_lora_b(self, lora_b: torch.Tensor) -> torch.Tensor: ...
     def slice_lora_b(
         self, lora_b: torch.Tensor | list[torch.Tensor | None]
     ) -> torch.Tensor | list[torch.Tensor | None]:

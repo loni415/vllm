@@ -13,10 +13,20 @@ from typing_extensions import TypeVar
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
-from vllm.multimodal.inputs import MultiModalPlaceholderDict
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class SamplingMask:
+    """Per-token sampling support sets aligned with completion token IDs.
+
+    Each inner list contains the vocabulary token IDs that survived
+    top-k / top-p / min-p filtering for the corresponding generated token.
+    """
+
+    token_ids: list[list[int]]
 
 
 @dataclass
@@ -31,6 +41,8 @@ class CompletionOutput:
             output text.
         logprobs: The log probabilities of the top probability words at each
             position if the logprobs are requested.
+        sampling_mask: The post-processing token support set for each generated
+            token, if requested.
         finish_reason: The reason why the sequence is finished.
         stop_reason: The stop string or token id that caused the completion
             to stop, None if the completion finished for some other reason
@@ -47,6 +59,7 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    sampling_mask: SamplingMask | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -57,6 +70,7 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
+            f"sampling_mask={self.sampling_mask}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "
@@ -104,7 +118,10 @@ class RequestOutput:
         encoder_prompt_token_ids: The token IDs of the encoder prompt.
                                   None if decoder-only.
         num_cached_tokens: The number of tokens with prefix cache hit.
+        num_cache_creation_tokens: Prompt tokens currently counted as local
+            prefix-cache writes for this request.
         kv_transfer_params: The params for remote K/V transfer.
+        ec_transfer_params: The params for remote encoder-cache transfer.
     """
 
     def __init__(
@@ -120,9 +137,10 @@ class RequestOutput:
         encoder_prompt: str | None = None,
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
+        num_cache_creation_tokens: int | None = None,
         *,
-        multi_modal_placeholders: MultiModalPlaceholderDict | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -134,7 +152,6 @@ class RequestOutput:
         self.request_id = request_id
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
-        self.multi_modal_placeholders = multi_modal_placeholders or {}
         self.prompt_logprobs = prompt_logprobs
         self.outputs = outputs
         self.finished = finished
@@ -143,13 +160,16 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.num_cache_creation_tokens = num_cache_creation_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.ec_transfer_params = ec_transfer_params
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        self.ec_transfer_params = next_output.ec_transfer_params
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -162,7 +182,7 @@ class RequestOutput:
                         completion.token_ids.extend(next_completion.token_ids)
                         if next_completion.logprobs:
                             assert completion.logprobs is not None
-                            completion.logprobs.extend(next_completion.logprobs)
+                            completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]
                         completion.cumulative_logprob = (
                             next_completion.cumulative_logprob
                         )
@@ -188,9 +208,19 @@ class RequestOutput:
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
             f"num_cached_tokens={self.num_cached_tokens}, "
-            f"multi_modal_placeholders={self.multi_modal_placeholders})"
+            f"num_cache_creation_tokens={self.num_cache_creation_tokens})"
         )
 
+
+# Sentinel to indicate request is finished, used with streaming inputs.
+STREAM_FINISHED = RequestOutput(
+    request_id="",
+    prompt=None,
+    prompt_token_ids=None,
+    prompt_logprobs=None,
+    outputs=[],
+    finished=True,
+)
 
 _O = TypeVar("_O", default=PoolingOutput)
 
@@ -221,7 +251,7 @@ class PoolingRequestOutput(Generic[_O]):
         self.finished = finished
         self.outputs = outputs
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{type(self).__name__}(request_id={self.request_id!r}, "
             f"outputs={self.outputs!r}, "
@@ -243,7 +273,7 @@ class EmbeddingOutput:
     embedding: list[float]
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput):
+    def from_base(pooling_output: PoolingOutput) -> "EmbeddingOutput":
         pooled_data = pooling_output.data
         if pooled_data.ndim != 1:
             raise ValueError("pooled_data should be a 1-D embedding vector")
@@ -260,7 +290,9 @@ class EmbeddingOutput:
 
 class EmbeddingRequestOutput(PoolingRequestOutput[EmbeddingOutput]):
     @staticmethod
-    def from_base(request_output: PoolingRequestOutput):
+    def from_base(
+        request_output: PoolingRequestOutput,
+    ) -> "EmbeddingRequestOutput":
         return EmbeddingRequestOutput(
             request_id=request_output.request_id,
             outputs=EmbeddingOutput.from_base(request_output.outputs),
@@ -282,7 +314,7 @@ class ClassificationOutput:
     probs: list[float]
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput):
+    def from_base(pooling_output: PoolingOutput) -> "ClassificationOutput":
         # pooling_output shape: (num_classes)
         pooled_data = pooling_output.data
         if pooled_data.ndim != 1:
@@ -300,7 +332,9 @@ class ClassificationOutput:
 
 class ClassificationRequestOutput(PoolingRequestOutput[ClassificationOutput]):
     @staticmethod
-    def from_base(request_output: PoolingRequestOutput):
+    def from_base(
+        request_output: PoolingRequestOutput,
+    ) -> "ClassificationRequestOutput":
         return ClassificationRequestOutput(
             request_id=request_output.request_id,
             outputs=ClassificationOutput.from_base(request_output.outputs),
@@ -321,7 +355,7 @@ class ScoringOutput:
     score: float
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput):
+    def from_base(pooling_output: PoolingOutput) -> "ScoringOutput":
         # pooling_output shape:
         #   classify task: (num_classes) num_classes == 1
         #   embed task: a scalar value
@@ -337,7 +371,9 @@ class ScoringOutput:
 
 class ScoringRequestOutput(PoolingRequestOutput[ScoringOutput]):
     @staticmethod
-    def from_base(request_output: PoolingRequestOutput):
+    def from_base(
+        request_output: PoolingRequestOutput,
+    ) -> "ScoringRequestOutput":
         return ScoringRequestOutput(
             request_id=request_output.request_id,
             outputs=ScoringOutput.from_base(request_output.outputs),

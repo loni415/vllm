@@ -30,6 +30,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import RCP_LN2
 
 
 @triton.jit
@@ -37,6 +38,7 @@ def _fwd_kernel(
     Q,
     K,
     V,
+    Sinks,
     sm_scale,
     B_Start_Loc,
     B_Seqlen,
@@ -56,6 +58,8 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     SLIDING_WINDOW_Q: tl.constexpr,
     SLIDING_WINDOW_K: tl.constexpr,
+    SINKS_BIAS_KEY0: tl.constexpr,
+    USE_SINKS: tl.constexpr,
     Lk: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
@@ -93,8 +97,20 @@ def _fwd_kernel(
     v_ptrs = V + off_v
 
     # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    if USE_SINKS:
+        sink = tl.load(Sinks + cur_head) * 1.4426950408889634
+        if SINKS_BIAS_KEY0:
+            # Sinks bias the logit of key 0, so the softmax starts empty and
+            # normalizes over the biased scores as usual.
+            m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+            l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        else:
+            # Sinks are a null logit that only inflates the denominator.
+            m_i = tl.full([BLOCK_M], sink, dtype=tl.float32)
+            l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    else:
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
@@ -105,20 +121,21 @@ def _fwd_kernel(
     # Apply causal attention pruning and sliding window attention pruning
     end_n = tl.minimum(end_n, (start_m + 1) * BLOCK_M) if IS_CAUSAL else end_n
 
-    # Calculate the start position for backward sliding window
+    # Calculate the start position for backward sliding window.
+    # Keys outside the window are fully masked below, so skip those blocks
+    # rather than loading them and discarding the result. Without this a
+    # windowed pass still costs O(seq_len^2).
     start_n_limit = 0
+    if SLIDING_WINDOW_Q > 0:
+        first_needed = start_m * BLOCK_M - SLIDING_WINDOW_Q
+        start_n_limit = tl.maximum(0, (first_needed // BLOCK_N) * BLOCK_N)
+    if SLIDING_WINDOW_K > 0:
+        last_needed = (start_m + 1) * BLOCK_M - 1 + SLIDING_WINDOW_K
+        end_n = tl.minimum(end_n, last_needed + 1)
     end_n_limit = block_mask * end_n
 
     for start_n in range(start_n_limit, end_n_limit, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- compute qk ----
-        k = tl.load(
-            k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
-            mask=((start_n + offs_n[None, :]) < cur_batch_seq_len) & (mask_d[:, None]),
-            other=0.0,
-        )
-
-        # Apply attention mask (causal + bidirectional sliding window)
+        # -- prepare attention mask ----
         # Position indices in the sequence
         pos_q = offs_m[:, None]  # Query positions [BLOCK_M, 1]
         pos_k = start_n + offs_n[None, :]  # Key positions [1, BLOCK_N]
@@ -141,53 +158,40 @@ def _fwd_kernel(
         if sliding_mask_k is not None:
             mask &= sliding_mask_k
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.where(mask, 0, float("-inf"))
-        qk += tl.dot(q, k)
-        qk *= sm_scale
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(
+            k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
+            mask=(pos_k < cur_batch_seq_len) & (mask_d[:, None]),
+            other=0.0,
+        )
 
-        # -- compute m_ij, p, l_ij
-        m_ij = tl.max(qk, 1)
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_ij_valid_mask = m_ij > float("-inf")
-        m_ij_masked = tl.where(m_ij_valid_mask, m_ij, 0.0)
-        # -- compute p and l_ij --
-        p = tl.exp(qk - m_ij_masked[:, None])
+        qk = tl.dot(q, k)
+        qk = tl.where(mask, qk * sm_scale, -1.0e8)
+        if USE_SINKS and SINKS_BIAS_KEY0:
+            qk = tl.where(mask & (pos_k == 0), qk + sink, qk)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+        p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
+
         # -- update m_i and l_i
-        m_i_new = tl.maximum(m_i, m_ij)
-        m_i_new_mask = m_i_new > float("-inf")
-        alpha = tl.exp(m_i - m_i_new)
-        beta = tl.exp(m_ij - m_i_new)
-        # mask alpha and beta for sliding window
-        alpha = tl.where(m_i_new_mask, alpha, 1.0)
-        beta = tl.where(m_i_new_mask, beta, 0.0)
-        l_i_new = alpha * l_i + beta * l_ij
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
         # -- update output accumulator --
-        # scale p
-        # For sliding window there's a chance the l_i_new is 0 due to masking
-        # the entire row. We need to set l_i_new 1 to avoid zero division
-        l_i_new_mask = (l_i_new != 0.0) & (m_i_new_mask > float("-inf"))
-        l_i_new_safe = tl.where(l_i_new_mask, l_i_new, 1.0)
-        p_scale = beta / l_i_new_safe
-        p = p * p_scale[:, None]
-        # scale acc
-        acc_scale = l_i / l_i_new_safe * alpha
-        acc = acc * acc_scale[:, None]
+        acc = acc * alpha[:, None]
         # update acc
         v = tl.load(
             v_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
             mask=((start_n + offs_n[:, None]) < cur_batch_seq_len) & (mask_d[None, :]),
             other=0.0,
         )
-
         p = p.to(v.dtype)
-        acc += tl.dot(p, v)
-        # update m_i and l_i
-        l_i = l_i_new
-        m_i = m_i_new
-    # initialize pointers to output
+        acc = tl.dot(p, v, acc)
+        # update m_i
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
     off_o = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
@@ -222,6 +226,8 @@ def context_attention_fwd(
     softmax_scale: float | None = None,
     sliding_window_q: int | None = None,
     sliding_window_k: int | None = None,
+    sinks: torch.Tensor | None = None,
+    sinks_bias_key0: bool = False,
 ):
     """
     q, k, v: [b * s, head, head_dim]
@@ -234,8 +240,13 @@ def context_attention_fwd(
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
+    # rescale with 1/ln(2) for triton exp2
+    sm_scale *= RCP_LN2
+
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
+    if sinks is not None:
+        assert sinks.shape[0] == head, "Sinks must be num_query_heads size"
 
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 4 if Lk <= 64 else 8
@@ -247,6 +258,7 @@ def context_attention_fwd(
         q,
         k,
         v,
+        sinks if sinks is not None else q,
         sm_scale,
         b_start_loc,
         b_seq_len,
@@ -266,6 +278,8 @@ def context_attention_fwd(
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW_Q=sliding_window_q,
         SLIDING_WINDOW_K=sliding_window_k,
+        USE_SINKS=sinks is not None,
+        SINKS_BIAS_KEY0=sinks_bias_key0,
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,

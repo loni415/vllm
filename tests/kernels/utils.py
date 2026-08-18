@@ -13,8 +13,9 @@ import torch
 from torch._prims_common import TensorLikeType
 
 from tests.kernels.quant_utils import native_w8a8_block_matmul
-from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.custom_op import op_registry
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.attention.backend import AttentionType
@@ -33,6 +34,63 @@ ALL_OPCHECK_TEST_UTILS: tuple[str, ...] = (
     "test_faketensor",
     "test_aot_dispatch_dynamic",
 )
+
+
+def _assert_accurate(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float = 0.0,
+    pass_rate: float = 0.99999,
+    max_violation_factor: float = 3.0,
+) -> None:
+    """Check numeric accuracy with pass-rate, max-error, and mean-error bounds."""
+    a = actual.detach().float().flatten()
+    e = expected.detach().float().flatten()
+
+    abs_err = (a - e).abs()
+    tol = atol + rtol * e.abs()
+
+    rate = (abs_err <= tol).float().mean().item()
+    assert rate >= pass_rate, (
+        f"Accuracy pass rate {rate:.6f} < {pass_rate} (atol={atol}, rtol={rtol})"
+    )
+
+    max_err = abs_err.max().item()
+    assert max_err <= max_violation_factor * atol, (
+        f"Max absolute error {max_err:.6f} exceeds {max_violation_factor} * atol={atol}"
+    )
+
+    mean_err = abs_err.mean().item()
+    assert mean_err <= atol * 0.25, (
+        f"Mean absolute error {mean_err:.6f} >= atol * 0.25 = {atol * 0.25:.6f}"
+    )
+
+
+def _assert_deterministic(
+    fn,
+    *args,
+    n_runs: int = 4,
+    **kwargs,
+) -> None:
+    """Verify that repeated calls produce bitwise-identical tensor outputs."""
+
+    def _collect(result: Any) -> list[torch.Tensor]:
+        if isinstance(result, torch.Tensor):
+            return [result.detach().clone()]
+        if isinstance(result, (tuple, list)):
+            return [t.detach().clone() for t in result if isinstance(t, torch.Tensor)]
+        raise TypeError(f"Unexpected return type {type(result)}")
+
+    reference = _collect(fn(*args, **kwargs))
+
+    for run in range(1, n_runs):
+        outputs = _collect(fn(*args, **kwargs))
+        for idx, (ref, out) in enumerate(zip(reference, outputs)):
+            assert torch.equal(ref, out), (
+                f"Run {run}: output[{idx}] differs from run 0 "
+                f"(max diff = {(out.float() - ref.float()).abs().max().item():.2e})"
+            )
 
 
 class QKVInputs(NamedTuple):
@@ -609,7 +667,7 @@ def _num_tokens_to_min_blocks(num_tokens: int, block_size: int) -> int:
     Compute the minimum number of blocks required to hold num_tokens tokens,
     given block_size
     """
-    return (num_tokens + block_size) // block_size
+    return (num_tokens + block_size - 1) // block_size
 
 
 def make_empty_slot_mapping_tensor(device: torch.device | str):
@@ -694,7 +752,7 @@ def make_block_tables_slot_mapping(
     For a sequence with num_tokens tokens the minimum number
     of required KV cache blocks is
 
-    num_blocks = (num_tokens + block_size) // block_size
+    num_blocks = (num_tokens + block_size - 1) // block_size
 
     Then the minimum KV cache size in blocks is
 
@@ -808,6 +866,35 @@ def fp8_allclose(
     )
 
 
+def bf16_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Representable-step distance between two bf16 tensors.
+
+    Reinterprets the bf16 bit patterns under the IEEE-754 total ordering so
+    that adjacent representable values differ by exactly 1.
+    """
+
+    def key(t: torch.Tensor) -> torch.Tensor:
+        u = t.contiguous().view(torch.int16).to(torch.int64) & 0xFFFF
+        return torch.where(u >= 0x8000, 0xFFFF - u, u + 0x8000)
+
+    return (key(a) - key(b)).abs()
+
+
+def fp8_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Representable-step distance between two 8-bit fp8 tensors.
+
+    Reinterprets the fp8 bytes under a sign-magnitude total ordering so that
+    adjacent representable values differ by exactly 1. Inputs must already share
+    the same fp8 encoding (e.g. both FP8_STORE_DTYPE).
+    """
+
+    def key(t: torch.Tensor) -> torch.Tensor:
+        u = t.contiguous().view(torch.uint8).to(torch.int64)
+        return torch.where(u >= 0x80, 0xFF - u, u + 0x80)
+
+    return (key(a) - key(b)).abs()
+
+
 # Marlin MoE test utils
 
 
@@ -840,7 +927,7 @@ def torch_experts(
     per_act_token_quant=False,
     block_shape: list[int] | None = None,
     apply_router_weights_on_input: bool = False,
-    activation: str = "silu_and_mul",
+    activation: MoEActivation = MoEActivation.SILU,
 ) -> torch.Tensor:
     assert (
         global_num_experts == -1
@@ -883,7 +970,7 @@ def torch_experts(
 
     f32 = torch.float32
 
-    act = CustomOp.op_registry[activation]
+    act = op_registry[activation.custom_op_name]
 
     for i in range(num_experts):
         mask = topk_ids == i
@@ -940,7 +1027,7 @@ def torch_experts(
                 if b_bias1 is not None:
                     tmp1 = tmp1 + b_bias1[i].view(1, -1).to(out.dtype)
 
-                tmp2 = SiluAndMul()(tmp1).to(out.dtype)
+                tmp2 = act()(tmp1).to(out.dtype)
 
                 tmp2, b_scale = moe_kernel_quantize_input(
                     tmp2, a2_scale, quant_dtype, per_act_token_quant, block_shape
@@ -973,7 +1060,7 @@ def torch_moe(
     b_bias2: torch.Tensor | None = None,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
-    activation: str = "silu_and_mul",
+    activation: MoEActivation = MoEActivation.SILU,
 ) -> torch.Tensor:
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)

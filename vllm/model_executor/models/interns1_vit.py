@@ -15,12 +15,13 @@ from transformers import PretrainedConfig
 from transformers.utils import torch_int
 
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from .utils import AutoWeightsLoader
 
 NORM2FN = {
     "rms_norm": RMSNorm,
@@ -170,6 +171,7 @@ class InternSdpaAttention(nn.Module):
         config: PretrainedConfig,
         *,
         num_dummy_heads: int = 0,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -215,7 +217,12 @@ class InternSdpaAttention(nn.Module):
         self.projection_layer = nn.Linear(self.dummy_dim, self.embed_dim)
 
         # Use unified MMEncoderAttention with automatic backend selection
-        self.attn = MMEncoderAttention(self.num_heads, self.head_dim, self.scale)
+        self.attn = MMEncoderAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scale,
+            prefix=f"{prefix}.attn",
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x shape: (B, N, C)"""
@@ -313,7 +320,11 @@ class InternS1VisionLayer(nn.Module):
         num_dummy_heads: int,
         prefix: str = "",
     ):
-        return InternSdpaAttention(config, num_dummy_heads=num_dummy_heads)
+        return InternSdpaAttention(
+            config,
+            num_dummy_heads=num_dummy_heads,
+            prefix=prefix,
+        )
 
     def forward(
         self,
@@ -423,11 +434,5 @@ class InternS1VisionModel(nn.Module):
         return encoder_outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

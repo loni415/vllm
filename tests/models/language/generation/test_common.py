@@ -3,6 +3,8 @@
 
 import pytest
 import torch
+from packaging.version import Version
+from transformers import __version__ as TRANSFORMERS_VERSION
 
 from vllm.platforms import current_platform
 
@@ -23,7 +25,6 @@ EMBED_SCALING_MODELS = {
 AITER_MODEL_LIST = [
     "meta-llama/Llama-3.2-1B-Instruct",
     "openbmb/MiniCPM3-4B",
-    "Qwen/Qwen-7B-Chat",
     "Qwen/Qwen2.5-0.5B-Instruct",
     "TitanML/tiny-mixtral",
     "Qwen/Qwen3-8B",
@@ -44,7 +45,7 @@ AITER_MODEL_LIST = [
         ),
         pytest.param(
             "openai-community/gpt2",  # gpt2
-            marks=[pytest.mark.core_model, pytest.mark.cpu_model],
+            marks=[pytest.mark.core_model],
         ),
         pytest.param("Milos/slovak-gpt-j-405M"),  # gptj
         pytest.param("bigcode/tiny_starcoder_py"),  # gpt_bigcode
@@ -81,9 +82,6 @@ AITER_MODEL_LIST = [
             marks=[pytest.mark.core_model, pytest.mark.slow_test],
         ),
         pytest.param(
-            "Qwen/Qwen-7B-Chat",  # qwen (text-only)
-        ),
-        pytest.param(
             "Qwen/Qwen2.5-0.5B-Instruct",  # qwen2
             marks=[
                 pytest.mark.core_model,
@@ -98,9 +96,13 @@ AITER_MODEL_LIST = [
         pytest.param("bigcode/starcoder2-3b"),  # starcoder2
         pytest.param(
             "TitanML/tiny-mixtral",  # mixtral
-            marks=[pytest.mark.core_model, pytest.mark.cpu_model],
+            marks=[pytest.mark.core_model],
         ),
         pytest.param("swiss-ai/Apertus-8B-Instruct-2509"),  # apertus
+        pytest.param(
+            "naver-hyperclovax/HyperCLOVAX-SEED-Think-14B",  # hyperclovax
+            marks=[large_gpu_mark(min_gb=32)],
+        ),
     ],
 )
 @pytest.mark.parametrize("max_tokens", [32])
@@ -124,6 +126,12 @@ def test_models(
     model_info.check_available_online(on_fail="skip")
     model_info.check_transformers_version(on_fail="skip")
 
+    if current_platform.is_rocm() and model == "TitanML/tiny-mixtral":
+        # Its single-token router selects LLMM1, whose low-precision
+        # accumulation can change the top-2 experts. Keep the optimized kernel
+        # enabled generally, but use the reference GEMM for this accuracy test.
+        monkeypatch.setenv("VLLM_ROCM_USE_SKINNY_GEMM", "0")
+
     if use_rocm_aiter and (model in AITER_MODEL_LIST):
         monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
     elif use_rocm_aiter and model not in AITER_MODEL_LIST:
@@ -133,7 +141,20 @@ def test_models(
         # in parts of the operators
         pytest.skip(f"Skipping '{model}' model test with AITER kernel.")
 
-    with hf_runner(model) as hf_model:
+    if model == "bigcode/starcoder2-3b":
+        # Replace example.txt's Test1 (an NL prompt) with a code prompt:
+        # starcoder2-3b is a code model, so NL prompts give near-uniform
+        # digit logits where HF<->vLLM bf16 drift can reorder top-K.
+        example_prompts = list(example_prompts)
+        example_prompts[1] = (
+            "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - "
+        )
+
+    with hf_runner(
+        model,
+        revision=model_info.revision,
+        trust_remote_code=model_info.trust_remote_code,
+    ) as hf_model:
         hf_outputs = hf_model.generate_greedy_logprobs_limit(
             example_prompts, max_tokens, num_logprobs
         )
@@ -147,6 +168,16 @@ def test_models(
             if prompt_embeds is not None:
                 embed = hf_model.model.get_input_embeddings()(token_ids)
 
+                if "gemma" in model.lower() and (
+                    Version(TRANSFORMERS_VERSION) < Version("5.3.0.dev0")
+                ):
+                    # For Gemma 1/2 models with Transformers 5.4.0+, the prompt
+                    # embeddings are normalised in `get_prompt_embeddings`,
+                    # like Gemma 3. For older versions, we need to manually normalise.
+                    embed_scale = hf_model.config.hidden_size**0.5
+                    normalizer = torch.tensor(embed_scale, dtype=embed.dtype)
+                    embed *= normalizer
+
                 # MiniCPM models apply scale_emb to embeddings internally.
                 # vLLM expects pre-scaled embeddings when using inputs_embeds.
                 if model in EMBED_SCALING_MODELS:
@@ -155,13 +186,29 @@ def test_models(
 
                 prompt_embeds.append(embed.squeeze(0))
 
+    vllm_kwargs = {}
+    if (
+        model == "bigscience/bloom-560m"
+        and current_platform.is_device_capability_family(90)
+    ):
+        # On SM90, the metadata builder otherwise selects FA3 AOT scheduling
+        # before Bloom's ALiBi layers fall back to FA2. Pinning FA2 keeps the
+        # builder and layer consistent and preserves the L4 test path.
+        vllm_kwargs["attention_config"] = {"flash_attn_version": 2}
+
     with vllm_runner(
         model,
         tokenizer_name=model_info.tokenizer or model,
         tokenizer_mode=model_info.tokenizer_mode,
+        revision=model_info.revision,
         trust_remote_code=model_info.trust_remote_code,
-        max_num_seqs=2,
+        # Remove the effects of batch variance on ROCm since batch invariance
+        # is not yet supported.
+        # See: https://github.com/vllm-project/vllm/issues/27433
+        max_num_seqs=1 if current_platform.is_rocm() else 2,
         enable_prompt_embeds=use_prompt_embeds,
+        compilation_config={"cudagraph_capture_sizes": [1, 2]},
+        **vllm_kwargs,
     ) as vllm_model:
         vllm_outputs = vllm_model.generate_greedy_logprobs(
             example_prompts, max_tokens, num_logprobs
@@ -191,4 +238,4 @@ def test_models(
         # unit tests. On ROCm, when using AITER
         # the memory might not be deallocated completely
         # before running the next test case
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()

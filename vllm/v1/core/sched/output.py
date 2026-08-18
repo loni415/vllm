@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from vllm._bc_linter import bc_linter_include
+from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 
 if TYPE_CHECKING:
     import numpy as np
@@ -18,10 +18,12 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
+    KVCacheBlockCopy = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -29,7 +31,6 @@ else:
     Request = object
 
 
-@bc_linter_include
 @dataclass
 class NewRequestData:
     req_id: str
@@ -41,6 +42,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    prompt_is_token_ids: list[bool] | None = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -62,8 +64,17 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
         )
+
+    @property
+    def prompt_len(self) -> int:
+        if self.prompt_token_ids is not None:
+            return len(self.prompt_token_ids)
+        if self.prompt_embeds is not None:
+            return self.prompt_embeds.shape[0]
+        return 0
 
     def __repr__(self) -> str:
         prompt_embeds_shape = (
@@ -109,7 +120,6 @@ class NewRequestData:
         )
 
 
-@bc_linter_include
 @dataclass
 class CachedRequestData:
     req_ids: list[str]
@@ -120,8 +130,8 @@ class CachedRequestData:
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
     new_token_ids: list[list[int]]
-    # For requests not scheduled in the last step, propagate the token ids to the
-    # connector. Won't contain requests that were scheduled in the prior step.
+    # MRV1-only: For requests not scheduled in the last step, propagate the token ids
+    # to the connector. Won't contain requests scheduled in the prior step.
     all_token_ids: dict[str, list[int]]
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
@@ -179,7 +189,14 @@ class CachedRequestData:
         )
 
 
-@bc_linter_include
+@dataclass
+class ScheduledEncoderInputStats:
+    """Stats for encoder inputs scheduled in one iteration."""
+
+    num_inputs: int = 0
+    output_tokens: int = 0
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -217,6 +234,8 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -237,6 +256,25 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+    # EC Cache Manager metadata
+    ec_manager_metadata: EncoderCacheManagerMetadata | None = None
+    # Block IDs freshly allocated from the pool during this scheduling step.
+    # The worker zeros the corresponding GPU memory before the blocks are used,
+    # preventing stale NaN/data from corrupting attention or SSM computation.
+    new_block_ids_to_zero: list[int] | None = None
+
+    # CoW copies to apply after zeroing new blocks and before forward.
+    kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+
+    # Producer partial-tail offload hand-off for external KV connectors:
+    # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
+    # the durable boundary block of a producer's last-prompt-boundary partial
+    # tail (mamba "align" CoW target). None unless partial hash hits are active.
+    partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+
+    # Dynamic speculative decoding: optimal K chosen by scheduler.
+    # Number of spec tokens to schedule for the next step.
+    num_spec_tokens_to_schedule: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

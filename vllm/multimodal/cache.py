@@ -39,6 +39,29 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class MultiModalCacheMissError(RuntimeError):
+    """Raised by the P1 receiver cache when items are requested with no data and
+    are not cached.
+
+    P0 (frontend) keeps a metadata-only shadow of P1 (engine) and sends
+    ``data=None`` on a shadow hit. The two caches are updated in different orders
+    across processes, so they can drift -- leaving P0 referencing items P1 has
+    evicted. Raising (instead of asserting) lets the engine return a retryable
+    response and have P0 drop the stale entries
+    (``BaseMultiModalProcessorCache.invalidate``) so the client resends the data.
+    Carries every drifted ``mm_hash`` in the request so P0 can drop them all in one
+    pass -- one retry then recovers the whole request, not one item per retry.
+    """
+
+    def __init__(self, mm_hashes: list[str]) -> None:
+        super().__init__(
+            f"Multi-modal items {mm_hashes} are not in the receiver (P1) cache and "
+            "no data was provided to recompute them (P0/P1 cache drift); the request "
+            "should be retried with the multi-modal data attached."
+        )
+        self.mm_hashes = mm_hashes
+
+
 class MultiModalProcessorCacheItem:
     """
     The data to store inside `MultiModalProcessorOnlyCache`.
@@ -295,6 +318,17 @@ class BaseMultiModalProcessorCache(
         """
         return [self.is_cached_item(mm_hash) for mm_hash in mm_hashes]
 
+    def invalidate(self, mm_hash: str) -> None:
+        """Drop ``mm_hash`` from this P0 shadow cache to recover from P0/P1 drift.
+
+        No-op by default; shadow caches that can drift from P1 override this.
+        """
+        pass
+
+    def close(self) -> None:
+        """Close the underlying cache, if needed."""
+        pass
+
     @abstractmethod
     def touch_sender_cache_item(self, mm_hash: str) -> None:
         """
@@ -429,6 +463,12 @@ class MultiModalProcessorSenderCache(BaseMultiModalProcessorCache):
     def make_stats(self, *, delta: bool = False) -> CacheInfo:
         return self._cache.stat(delta=delta)
 
+    @override
+    def invalidate(self, mm_hash: str) -> None:
+        # Drop our stale shadow entry so the next request for this hash re-sends the
+        # data and repopulates P1 (see MultiModalCacheMissError).
+        self._cache.pop(mm_hash, None)
+
 
 class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
     """
@@ -459,8 +499,8 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
             ring_buffer=ring_buffer,
             serde_class=MsgpackSerde,
         )
-        # cache (prompt_updates, modality) for P0 only
-        self._p0_cache: dict[str, tuple[Sequence[ResolvedPromptUpdate], str]] = {}
+        # cache prompt_updates for P0 only
+        self._p0_cache: dict[str, Sequence[ResolvedPromptUpdate]] = {}
 
         self._hits = 0
         self._total = 0
@@ -491,28 +531,43 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
             self._total += 1
 
             address, monotonic_id = self._shm_cache.get_cached(mm_hash)
-            prompt_updates, modality = self._p0_cache[mm_hash]
-            return self.address_as_item(address, monotonic_id, modality), prompt_updates
+            prompt_updates = self._p0_cache[mm_hash]
+            return self.address_as_item(address, monotonic_id), prompt_updates
 
         assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
+        item, prompt_updates = mm_item
 
         self._total += 1
 
         try:
-            address, monotonic_id = self._shm_cache.put(mm_hash, mm_item[0])
+            address, monotonic_id = self._shm_cache.put(mm_hash, item)
             # Try to remove dangling items if p0 cache is too large.
             if len(self._p0_cache) >= 2 * len(self._shm_cache.key_index):
                 self.remove_dangling_items()
-            self._p0_cache[mm_hash] = mm_item[1], mm_item[0].modality
-            address_item = self.address_as_item(
-                address, monotonic_id, mm_item[0].modality
+
+            self._p0_cache[mm_hash] = prompt_updates
+            return self.address_as_item(address, monotonic_id), prompt_updates
+        except ValueError as e:
+            # `put` raises ValueError either for an oversize item or for a
+            # duplicate key (concurrent insert); the latter is benign so we
+            # only warn on the oversize case. Subsequent UUID-only requests
+            # for an oversize item will fail with a cache miss.
+            if "already exists" not in str(e):
+                logger.warning_once(
+                    "mm_input %s too large to cache; "
+                    "raise --mm-shm-cache-max-object-size-mb. (%s)",
+                    mm_hash,
+                    str(e),
+                )
+            return mm_item
+        except MemoryError as e:
+            # Cache full and protected items prevent eviction.
+            logger.debug(
+                "mm_input %s not cached; shm cache full, "
+                "consider raising --mm-processor-cache-gb. (%s)",
+                mm_hash,
+                str(e),
             )
-            return address_item, mm_item[1]
-        except (ValueError, MemoryError) as e:
-            # put may fail if the object is too large or
-            # the cache is full.
-            # In this case we log the error and keep the original mm_input.
-            logger.debug("Failed to cache mm_input with hash %s: %s", mm_hash, e)
             return mm_item
 
     @override
@@ -534,6 +589,10 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
     def make_stats(self, *, delta: bool = False) -> CacheInfo:
         return self._stat(delta=delta)
 
+    @override
+    def close(self) -> None:
+        self._shm_cache.close()
+
     def remove_dangling_items(self) -> None:
         """Remove items that are no longer in the shared memory cache."""
         cached_hashes = self._shm_cache.key_index.keys()
@@ -542,22 +601,20 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
             del self._p0_cache[mm_hash]
 
     def address_as_item(
-        self, address: int, monotonic_id: int, modality: str
+        self,
+        address: int,
+        monotonic_id: int,
     ) -> MultiModalKwargsItem:
         addr_elem = MultiModalFieldElem(
-            modality=modality,
-            key="address",
             data=address,
             field=MultiModalBatchedField(),
         )
         id_elem = MultiModalFieldElem(
-            modality=modality,
-            key="monotonic_id",
             data=monotonic_id,
             field=MultiModalBatchedField(),
         )
-        mm_item = MultiModalKwargsItem.from_elems([addr_elem, id_elem])
-        return mm_item
+
+        return MultiModalKwargsItem({"address": addr_elem, "monotonic_id": id_elem})
 
 
 class BaseMultiModalReceiverCache(
@@ -581,9 +638,19 @@ class BaseMultiModalReceiverCache(
             cache_key = feature.mm_hash or feature.identifier
             self.touch_receiver_cache_item(cache_key, feature.data)
 
+        missing_mm_hashes: list[str] = []
         for feature in mm_features:
             cache_key = feature.mm_hash or feature.identifier
-            feature.data = self.get_and_update_item(feature.data, cache_key)
+            try:
+                feature.data = self.get_and_update_item(feature.data, cache_key)
+            except MultiModalCacheMissError as e:
+                # Collect every drifted hash in this request before raising, so the
+                # engine can have P0 invalidate them all at once -- otherwise a
+                # request with k drifted items needs k client retries (each resend
+                # only un-shadows the one reported hash).
+                missing_mm_hashes.extend(e.mm_hashes)
+        if missing_mm_hashes:
+            raise MultiModalCacheMissError(missing_mm_hashes)
         return mm_features
 
     @abstractmethod
@@ -636,7 +703,11 @@ class MultiModalReceiverCache(BaseMultiModalReceiverCache):
         if (cached_item := self._cache.get(mm_hash)) is not None:
             return cached_item
 
-        assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
+        # No data and not cached here: P0 sent data=None trusting its shadow, but
+        # the P0/P1 caches have drifted. Raise a retryable error (not assert) so the
+        # engine can have P0 drop the stale entry and the client resend the data.
+        if mm_item is None:
+            raise MultiModalCacheMissError([mm_hash])
 
         self._cache[mm_hash] = mm_item
         return mm_item

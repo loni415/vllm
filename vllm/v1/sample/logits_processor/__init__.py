@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor as RequestLogitsProcessor
 from vllm.sampling_params import SamplingParams
@@ -202,10 +203,11 @@ def build_logitsprocs(
         if custom_logitsprocs:
             raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
         logger.warning(
-            "min_p, logit_bias, and min_tokens parameters won't currently work "
-            "with speculative decoding enabled."
+            "min_p and logit_bias parameters won't work with speculative decoding."
         )
-        return LogitsProcessors()
+        return LogitsProcessors(
+            [MinTokensLogitsProcessor(vllm_config, device, is_pin_memory)]
+        )
 
     custom_logitsprocs_classes = _load_custom_logitsprocs(custom_logitsprocs)
     return LogitsProcessors(
@@ -227,7 +229,12 @@ def validate_logits_processors_parameters(
         tuple(logits_processors) if logits_processors is not None else None
     )
     for logits_procs in cached_load_custom_logitsprocs(logits_processors):
-        logits_procs.validate_params(sampling_params)
+        try:
+            logits_procs.validate_params(sampling_params)
+        except ValueError as e:
+            # Legacy custom logitsprocs may still raise ValueError from
+            # validate_params; convert for backward compatibility.
+            raise VLLMValidationError(str(e)) from e
 
 
 class AdapterLogitsProcessor(LogitsProcessor):
@@ -308,12 +315,16 @@ class AdapterLogitsProcessor(LogitsProcessor):
 
         """
         if req_lp := self.new_req_logits_processor(params):
-            args = (
-                [prompt_ids, output_ids]
-                if (len(inspect.signature(req_lp).parameters) == 3)
-                else [output_ids]
-            )
-            return partial(req_lp, *args)  # type: ignore[misc]
+            if len(inspect.signature(req_lp).parameters) == 3:
+                if prompt_ids is None:
+                    raise ValueError(
+                        "Prompt token ids are required for this "
+                        "logits processor but were not provided."
+                    )
+                args = [prompt_ids, output_ids]
+            else:
+                args = [output_ids]
+            return partial(req_lp, *args)
         return None
 
     def update_state(self, batch_update: BatchUpdate | None):

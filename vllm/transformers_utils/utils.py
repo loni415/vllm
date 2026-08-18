@@ -23,8 +23,19 @@ def is_gcs(model_or_path: str) -> bool:
     return model_or_path.lower().startswith("gs://")
 
 
+def is_azure(model_or_path: str) -> bool:
+    return model_or_path.lower().startswith("az://")
+
+
 def is_cloud_storage(model_or_path: str) -> bool:
-    return is_s3(model_or_path) or is_gcs(model_or_path)
+    return is_s3(model_or_path) or is_gcs(model_or_path) or is_azure(model_or_path)
+
+
+def without_trust_remote_code(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return kwargs without trust_remote_code without modifying original dict."""
+    if "trust_remote_code" not in kwargs:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
 
 
 def modelscope_list_repo_files(
@@ -37,15 +48,14 @@ def modelscope_list_repo_files(
 
     api = HubApi()
     api.login(token)
+
     # same as huggingface_hub.list_repo_files
-    files = [
+    return [
         file["Path"]
         for file in api.get_model_files(
             model_id=repo_id, revision=revision, recursive=True
         )
-        if file["Type"] == "blob"
     ]
-    return files
 
 
 def _maybe_json_dict(path: str | PathLike) -> dict[str, str]:
@@ -73,8 +83,11 @@ def maybe_model_redirect(model: str) -> str:
     """
     Use model_redirect to redirect the model name to a local folder.
 
-    :param model: hf model name
-    :return: maybe redirect to a local folder
+    Args:
+        model: hf model name
+
+    Returns:
+        maybe redirect to a local folder
     """
 
     model_redirect_path = envs.VLLM_MODEL_REDIRECT_PATH

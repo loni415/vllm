@@ -13,7 +13,38 @@ from tests.kernels.allclose_default import get_default_atol, get_default_rtol
 from tests.kernels.utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+
+
+@pytest.fixture
+def default_vllm_config(monkeypatch):
+    """Enable the AITER triton rope on ROCm for fp16-consistent numerics.
+
+    The fused CUDA kernel runs native fp16 while forward_native upcasts to
+    fp32, so on ROCm we route through the AITER triton rope (+rotary_embedding)
+    to match. Its env gates are cached at import, hence refresh_env_variables().
+    """
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+
+    is_rocm = current_platform.is_rocm()
+    if is_rocm:
+        config = VllmConfig(
+            compilation_config=CompilationConfig(custom_ops=["+rotary_embedding"])
+        )
+    else:
+        config = VllmConfig()
+    try:
+        with monkeypatch.context() as m, set_current_vllm_config(config):
+            if is_rocm:
+                m.setenv("VLLM_ROCM_USE_AITER", "1")
+                m.setenv("VLLM_ROCM_USE_AITER_TRITON_ROPE", "1")
+                rocm_aiter_ops.refresh_env_variables()
+            yield config
+    finally:
+        if is_rocm:
+            rocm_aiter_ops.refresh_env_variables()
 
 
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float])
@@ -27,7 +58,8 @@ from vllm.utils.torch_utils import set_random_seed
 @pytest.mark.parametrize("block_size", [16, 64, 256])
 @pytest.mark.parametrize("seed", [0])
 @pytest.mark.parametrize(
-    "device", [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
+    "device",
+    [f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)],
 )
 @torch.inference_mode()
 def test_concat_and_cache_mla_rope_fused(
@@ -68,9 +100,17 @@ def test_concat_and_cache_mla_rope_fused(
     k_pe = torch.flatten(key[..., :qk_rope_head_dim], start_dim=1).to(device=device)
     kv_c = torch.flatten(key[..., qk_rope_head_dim:], start_dim=1).to(device=device)
 
-    # NOTE(woosuk): The reference implementation should be executed first
-    # because the custom kernel is in-place.
-    ref_q_pe, ref_k_pe = rope.forward_native(positions, query, k_pe)
+    if current_platform.is_rocm():
+        # We use forward_hip for the same numerics as the fused custom kernel on ROCm
+        # when dtype is FP16. The torch-native implementation implicitly upcasts
+        # FP16 x FP16 multiplications to FP32 before downcasting them, which leads
+        # to notable output divergences.
+        # Clone the tensors because the implementation modifies them in-place
+        ref_q_pe, ref_k_pe = rope.forward_hip(positions, query.clone(), k_pe.clone())
+    else:
+        # NOTE(woosuk): The reference implementation should be executed first
+        # because the custom kernel is in-place.
+        ref_q_pe, ref_k_pe = rope.forward_native(positions, query, k_pe)
     assert ref_k_pe is not None
 
     ref_k_pe = torch.flatten(ref_k_pe, start_dim=1).to(device=device)
@@ -141,6 +181,14 @@ def test_concat_and_cache_mla_rope_fused(
         kv_cache_scale,
     )
 
+    # On ROCm the AITER Triton rope diverges by ~1 ULP from the fused kernel,
+    # which the tight CUDA tolerances don't cover for the low-precision paths:
+    #  - bf16: up to ~1 bf16 ULP (0.0156-0.03125 at values ~2-3), so relax the
+    #    kv-cache atol (bounded ~0.02) and the query atol (~0.04).
+    #  - neox-style fp8: one e4m3 ULP (~12.5%), so relax rtol.
+    # Other paths use the CUDA defaults.
+    rocm_neox = current_platform.is_rocm() and is_neox_style
+    rocm_bf16 = current_platform.is_rocm() and dtype == torch.bfloat16
     if kv_cache_dtype == "fp8":
         result_temp = torch.empty_like(kv_cache, dtype=torch.float16)
         ops.convert_fp8(
@@ -153,10 +201,22 @@ def test_concat_and_cache_mla_rope_fused(
         ops.convert_fp8(
             expected_temp, ref_kv_cache, kv_cache_scale.item(), kv_dtype=kv_cache_dtype
         )
-        torch.testing.assert_close(result_temp, expected_temp, atol=0.001, rtol=0.1)
+        torch.testing.assert_close(
+            result_temp,
+            expected_temp,
+            atol=0.004 if rocm_bf16 else 0.001,
+            rtol=0.15 if rocm_neox or rocm_bf16 else 0.1,
+        )
+    elif rocm_bf16:
+        torch.testing.assert_close(kv_cache, ref_kv_cache, atol=0.02, rtol=1e-3)
+    elif rocm_neox:
+        torch.testing.assert_close(kv_cache, ref_kv_cache, atol=1e-3, rtol=1e-3)
     else:
         torch.testing.assert_close(kv_cache, ref_kv_cache)
 
     torch.testing.assert_close(
-        query, ref_q_pe, atol=get_default_atol(query), rtol=get_default_rtol(query)
+        query,
+        ref_q_pe,
+        atol=0.04 if rocm_bf16 else get_default_atol(query),
+        rtol=get_default_rtol(query),
     )

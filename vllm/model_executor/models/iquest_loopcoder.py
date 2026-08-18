@@ -24,10 +24,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -438,7 +438,7 @@ class IQuestLoopCoderModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -475,18 +475,6 @@ class IQuestLoopCoderModel(nn.Module):
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
-                continue
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "gate_projections" in name:
@@ -553,15 +541,14 @@ class IQuestLoopCoderForCausalLM(nn.Module):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
         if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
@@ -570,7 +557,7 @@ class IQuestLoopCoderForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

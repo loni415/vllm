@@ -10,7 +10,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import partial
 
 import torch
@@ -18,13 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPVisionConfig
 
-from vllm.config import MultiModalConfig
-from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .clip import CLIPEncoder, CLIPVisionEmbeddings
+from .utils import AutoWeightsLoader
 
 
 class MLPBlock(nn.Module):
@@ -73,13 +73,14 @@ class ImageEncoderViT(nn.Module):
         mlp_ratio: float = 4.0,
         out_chans: int = 256,
         qkv_bias: bool = True,
-        norm_layer: type[nn.Module] = nn.LayerNorm,
+        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
         act_layer: type[nn.Module] = nn.GELU,
         use_abs_pos: bool = True,
         use_rel_pos: bool = False,
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: tuple[int, ...] = (),
+        last_conv_output: int = 1024,
     ) -> None:
         """
         Args:
@@ -156,7 +157,7 @@ class ImageEncoderViT(nn.Module):
             256, 512, kernel_size=3, stride=2, padding=1, bias=False
         )
         self.net_3 = Conv2dLayer(
-            512, 1024, kernel_size=3, stride=2, padding=1, bias=False
+            512, last_conv_output, kernel_size=3, stride=2, padding=1, bias=False
         )
 
     def get_abs_pos(self, abs_pos: torch.Tensor, tgt_size: int):
@@ -204,7 +205,7 @@ class Block(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
-        norm_layer: type[nn.Module] = nn.LayerNorm,
+        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
         act_layer: type[nn.Module] = nn.GELU,
         use_rel_pos: bool = False,
         rel_pos_zero_init: bool = True,
@@ -263,8 +264,12 @@ class Block(nn.Module):
         return x
 
 
-class RelPosAttention(nn.Module):
+# --8<-- [start:rel_pos_attention]
+@PluggableLayer.register("rel_pos_attention")
+class RelPosAttention(PluggableLayer):
     """Multi-head Attention block with relative position embeddings."""
+
+    # --8<-- [end:rel_pos_attention]
 
     def __init__(
         self,
@@ -321,6 +326,7 @@ class RelPosAttention(nn.Module):
         v = v.view(B, self.num_heads, H * W, -1)
 
         if self.use_rel_pos:
+            assert rel_h is not None and rel_w is not None
             rel_h = rel_h.view(
                 B, self.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3)
             )
@@ -609,7 +615,6 @@ class DeepCLIPVisionTransformer(nn.Module):
         self,
         config: CLIPVisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         *,
         num_hidden_layers_override: int | None = None,
         prefix: str = "",
@@ -628,7 +633,6 @@ class DeepCLIPVisionTransformer(nn.Module):
         self.transformer = CLIPEncoder(
             config=config,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             num_hidden_layers_override=num_hidden_layers_override,
             prefix=f"{prefix}.encoder",
             attn_cls=MMEncoderAttention,
@@ -668,12 +672,5 @@ class DeepCLIPVisionTransformer(nn.Module):
         return encoder_outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

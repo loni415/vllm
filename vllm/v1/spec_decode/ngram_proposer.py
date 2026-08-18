@@ -3,6 +3,7 @@
 import os
 
 import numpy as np
+import torch
 from numba import get_num_threads, jit, njit, prange, set_num_threads
 
 from vllm.config import VllmConfig
@@ -54,6 +55,7 @@ class NgramProposer:
         # Trigger Numba JIT compilation for N-gram proposer.
         # This usually takes less than 1 second.
         self.propose(
+            self.k,
             [[]] * 1024,
             np.zeros(1024, dtype=np.int32),
             np.zeros((1024, self.max_model_len), dtype=np.int32),
@@ -65,6 +67,7 @@ class NgramProposer:
         valid_ngram_requests: list,
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
+        k: int,
     ) -> list[list[int]]:
         """Batch version of ngram proposer using numba for acceleration.
 
@@ -77,6 +80,8 @@ class NgramProposer:
             token_ids_cpu:
                 Numpy array of shape (batch_size, max_model_len)
                 representing the token IDs for each request.
+            k:
+                Number of speculative tokens to propose.
 
         Returns:
             list[list[int]]:
@@ -109,7 +114,7 @@ class NgramProposer:
                 self.min_n,
                 self.max_n,
                 self.max_model_len,
-                self.k,
+                k,
                 self.valid_ngram_draft,
                 self.valid_ngram_num_drafts,
             )
@@ -129,10 +134,16 @@ class NgramProposer:
 
     def propose(
         self,
+        num_speculative_tokens: int,
         sampled_token_ids: list[list[int]],
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,  # unused
     ) -> list[list[int]]:
+        assert num_speculative_tokens <= self.k
+
         # find which requests need ngram proposals
         valid_ngram_requests = []
         for i, sampled_ids in enumerate(sampled_token_ids):
@@ -153,6 +164,7 @@ class NgramProposer:
             valid_ngram_requests,
             num_tokens_no_spec,
             token_ids_cpu,
+            num_speculative_tokens,
         )
 
         return draft_token_ids

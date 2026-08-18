@@ -41,12 +41,13 @@ if printf '%s\n' "${FILES[@]}" | grep -q "^docker/Dockerfile$"; then
     --rm \
     --user "$(id -u):$(id -g)" \
     --workdir /workspace \
-    --volume "$(pwd)":/workspace \
+    --volume "$(pwd -P)":/workspace \
     ghcr.io/patrickhoefler/dockerfilegraph:alpine \
     --output png \
     --dpi 200 \
     --max-label-length 50 \
     --filename docker/Dockerfile \
+    --concentrate \
     --legend
   
   echo "Finding generated PNG file..."

@@ -4,21 +4,35 @@
 import pytest
 import torch
 
-from tests.kernels.moe.utils import make_test_quant_config, make_test_weights
-from tests.kernels.quant_utils import (
-    native_per_token_group_quant_fp8,
-    native_w8a8_block_matmul,
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from tests.kernels.moe.utils import (
+    make_dummy_moe_config,
+    make_test_quant_config,
+    make_test_weights,
+    modular_triton_fused_moe,
 )
+from tests.kernels.quant_utils import native_w8a8_block_matmul
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import fused_experts
-from vllm.model_executor.layers.fused_moe.deep_gemm_moe import (
-    _valid_deep_gemm_shape,
-    deep_gemm_moe_fp8,
-)
-from vllm.model_executor.layers.fused_moe.fused_moe import (
+from vllm.model_executor.layers.fused_moe import (
+    fused_experts,
     fused_topk,
-    modular_triton_fused_moe,
+)
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    fp8_w8a8_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+    _valid_deep_gemm_shape,
+)
+from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
+    TritonOrDeepGemmExperts,
+)
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
@@ -91,8 +105,16 @@ TOP_KS = [1, 2, 6]
 SEEDS = [0]
 
 
-def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape):
-    """Fused moe with block-wise quantization using native torch."""
+def torch_w8a8_block_fp8_moe(
+    a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape, silu_fp32=False
+):
+    """Fused MoE with block-wise fp8 quantization using native torch.
+
+    silu_fp32=True computes the intermediate SiLU in fp32 and quantizes it
+    directly, matching the modular Helion silu_and_mul_per_block_quant kernel;
+    False rounds the SiLU output to bf16 first, matching fused_experts. Each
+    kernel is checked against the reference variant matching its precision.
+    """
     B, D = a.shape
     topk = topk_ids.size(1)
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -102,7 +124,10 @@ def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block
     topk_ids = topk_ids.view(-1)
 
     _, block_k = block_shape[0], block_shape[1]
-    a_q, a_s = native_per_token_group_quant_fp8(a, block_k)
+    # Quantize with the production per-token-group fp8 kernel (same HIP/CUDA op the
+    # kernels use) so the reference is bit-identical here; removes ~0.06-0.10% fp8
+    # boundary-flip divergence that otherwise accumulates over K. Matmul stays fp32.
+    a_q, a_s = per_token_group_quant_fp8(a, block_k, dtype=current_platform.fp8_dtype())
     a_q = a_q.to(torch.float32)
     for i in range(w1.shape[0]):
         mask = topk_ids == i
@@ -110,8 +135,12 @@ def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block
             inter_out = native_w8a8_block_matmul(
                 a_q[mask], w1[i], a_s[mask], w1_s[i], block_shape, output_dtype=a.dtype
             )
-            act_out = SiluAndMul().forward_native(inter_out)
-            act_out_q, act_out_s = native_per_token_group_quant_fp8(act_out, block_k)
+            act_out = SiluAndMul().forward_native(
+                inter_out.float() if silu_fp32 else inter_out
+            )
+            act_out_q, act_out_s = per_token_group_quant_fp8(
+                act_out, block_k, dtype=current_platform.fp8_dtype()
+            )
             out[mask] = native_w8a8_block_matmul(
                 act_out_q, w2[i], act_out_s, w2_s[i], block_shape, output_dtype=a.dtype
             )
@@ -144,8 +173,6 @@ def test_w8a8_block_fp8_fused_moe(
 
     torch.manual_seed(seed)
 
-    monkeypatch.setenv("VLLM_FUSED_MOE_CHUNK_SIZE", "2048")
-
     a = torch.randn((M, K), dtype=dtype) / 10
     score = torch.randn((M, E), dtype=dtype)
 
@@ -159,7 +186,7 @@ def test_w8a8_block_fp8_fused_moe(
         block_shape=block_size,
     )
 
-    m_fused_moe = modular_triton_fused_moe(quant_config)
+    m_fused_moe = modular_triton_fused_moe(make_dummy_moe_config(), quant_config)
 
     topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
 
@@ -180,12 +207,43 @@ def test_w8a8_block_fp8_fused_moe(
             a, w1, w2, topk_weights, topk_ids, quant_config=quant_config
         )
 
-        m_out = m_fused_moe(a, w1, w2, topk_weights, topk_ids)
+        m_out = m_fused_moe.apply(
+            a,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            global_num_experts=w1.shape[0],
+        )
 
     # 0.039 only needed for M >= 8192
     tol = 0.035 if M < 8192 else 0.039
+
+    # The modular path fuses SiLU+quant in fp32 (silu_and_mul_per_block_quant),
+    # while fused_experts/the reference round SiLU to bf16 first. On large K/N this
+    # ~1-ULP gap pushes m_out past the base tol, so validate m_out against an
+    # fp32-SiLU reference — keeping the tight base tolerance, no widened override.
+    if current_platform.is_rocm() and K >= 4096 and N >= 1024:
+        with set_current_vllm_config(vllm_config):
+            ref_out_m = torch_w8a8_block_fp8_moe(
+                a,
+                w1,
+                w2,
+                quant_config.w1_scale,
+                quant_config.w2_scale,
+                topk_weights,
+                topk_ids,
+                block_size,
+                silu_fp32=True,
+            )
+    else:
+        ref_out_m = ref_out
+
     torch.testing.assert_close(out, ref_out, atol=tol, rtol=tol)
-    torch.testing.assert_close(m_out, ref_out, atol=tol, rtol=tol)
+    torch.testing.assert_close(m_out, ref_out_m, atol=tol, rtol=tol)
 
 
 @pytest.mark.parametrize(("M", "N", "K"), MNK_FACTORS_DG)
@@ -202,11 +260,8 @@ def test_w8a8_block_fp8_deep_gemm_fused_moe(M, N, K, E, topk, seed, monkeypatch)
     if not _valid_deep_gemm_shape(M, N, K):
         pytest.skip(f"Skipping test: invalid size m={M}, n={N}, k={K}")
 
-    chunk_size = 1024
-
     torch.manual_seed(seed)
 
-    monkeypatch.setenv("VLLM_FUSED_MOE_CHUNK_SIZE", str(chunk_size))
     block_size = get_mk_alignment_for_contiguous_layout()
     dtype = torch.bfloat16
 
@@ -228,11 +283,42 @@ def test_w8a8_block_fp8_deep_gemm_fused_moe(M, N, K, E, topk, seed, monkeypatch)
     # setup code in case we are able to revisit this later.
     use_compile = False
 
-    use_cudagraph = (
-        chunk_size < M and N >= 1024 and K >= 1024 and current_platform.is_cuda_alike()
-    )
+    use_cudagraph = N >= 1024 and K >= 1024 and current_platform.is_cuda_alike()
 
     topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
+
+    quant_config = fp8_w8a8_moe_quant_config(
+        w1_scale=w1_s,
+        w2_scale=w2_s,
+        block_shape=block_size,
+    )
+    moe_config = make_dummy_moe_config()
+
+    deep_gemm_experts = mk.FusedMoEKernel(
+        prepare_finalize=maybe_make_prepare_finalize(
+            moe=moe_config,
+            quant_config=quant_config,
+            allow_new_interface=True,
+            use_monolithic=False,
+        ),
+        fused_experts=TritonOrDeepGemmExperts(
+            moe_config=moe_config,
+            quant_config=quant_config,
+        ),
+    )
+
+    def deep_gemm_moe_fp8(a, w1, w2, w1_s, w2_s, topk_weights, topk_ids):
+        return deep_gemm_experts.apply(
+            hidden_states=a,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_num_experts=E,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=False,
+        )
 
     # Set the context to avoid lots of warning spam.
     with set_current_vllm_config(vllm_config):
@@ -260,8 +346,8 @@ def test_w8a8_block_fp8_deep_gemm_fused_moe(M, N, K, E, topk, seed, monkeypatch)
                 out = deep_gemm_moe_fp8_fn(
                     a, w1, w2, w1_s, w2_s, topk_weights, topk_ids
                 )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
     torch.testing.assert_close(out, ref_out, atol=0.035, rtol=0.035)

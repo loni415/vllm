@@ -29,6 +29,16 @@ def enable_pickle(monkeypatch):
 
 models = ["Qwen/Qwen2-VL-2B-Instruct"]
 target_dtype = "half"
+IMAGE_SIZE_FACTOR_GROUPS = (
+    (0.5,),
+    (0.5, 0.5),
+    (0.25, 0.5, 0.5),
+)
+VIDEO_SIZE_FACTOR_GROUPS = (
+    (0.5,),
+    (0.5, 0.5),
+    (0.25, 0.25, 0.5),
+)
 
 IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
@@ -198,10 +208,10 @@ def batch_make_video_embeddings(
         videos += video_batch
 
     # video to pixel values
-    image_processor = processor.image_processor
+    video_processor = processor.video_processor
 
-    preprocess_result = image_processor.preprocess(
-        images=None, videos=videos, return_tensors="pt"
+    preprocess_result = video_processor.preprocess(
+        videos=videos, return_tensors="pt"
     ).data
     pixel_values = preprocess_result["pixel_values_videos"]
     video_grid_thw = preprocess_result["video_grid_thw"]
@@ -222,7 +232,7 @@ def batch_make_video_embeddings(
     embed_counter = 0
     for video_batch in video_batches_:
         cur_batch_video_count = len(video_batch)
-        merge_size = image_processor.merge_size
+        merge_size = video_processor.merge_size
         cur_batch_embed_len = sum(
             grid_thw.prod(-1) // merge_size // merge_size
             for grid_thw in video_grid_thw[
@@ -323,17 +333,6 @@ def run_embedding_input_test(
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize(
-    "size_factors",
-    [
-        # Single-scale
-        [0.5],
-        # Single-scale, batched
-        [0.5, 0.5],
-        # Multi-scale
-        [0.25, 0.5, 0.5],
-    ],
-)
 @pytest.mark.parametrize("dtype", [target_dtype])
 @pytest.mark.parametrize("max_tokens", [128])
 @pytest.mark.parametrize("num_logprobs", [10])
@@ -341,7 +340,6 @@ def test_qwen2_vl_image_embeddings_input(
     vllm_runner,
     image_assets,
     model,
-    size_factors,
     dtype,
     max_tokens,
     num_logprobs,
@@ -355,6 +353,7 @@ def test_qwen2_vl_image_embeddings_input(
             [rescale_image_size(image, factor) for factor in size_factors],
             [],
         )
+        for size_factors in IMAGE_SIZE_FACTOR_GROUPS
         for image, prompt in zip(images, IMAGE_PROMPTS)
     ]
 
@@ -372,18 +371,6 @@ def test_qwen2_vl_image_embeddings_input(
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize(
-    "size_factors",
-    [
-        [],
-        # Single-scale
-        [0.5],
-        # Single-scale, batched
-        [0.5, 0.5],
-        # Multi-scale
-        [0.25, 0.5, 0.5],
-    ],
-)
 @pytest.mark.parametrize("dtype", [target_dtype])
 @pytest.mark.parametrize("max_tokens", [128])
 @pytest.mark.parametrize("num_logprobs", [10])
@@ -391,7 +378,6 @@ def test_qwen2_vl_multiple_image_embeddings_input(
     vllm_runner,
     image_assets,
     model,
-    size_factors,
     dtype: str,
     max_tokens: int,
     num_logprobs: int,
@@ -407,6 +393,7 @@ def test_qwen2_vl_multiple_image_embeddings_input(
             ],
             [],
         )
+        for size_factors in IMAGE_SIZE_FACTOR_GROUPS
     ]
 
     run_embedding_input_test(
@@ -423,17 +410,6 @@ def test_qwen2_vl_multiple_image_embeddings_input(
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize(
-    "size_factors",
-    [
-        # Single-scale
-        [0.5],
-        # Single-scale, batched
-        [0.5, 0.5],
-        # Multi-scale
-        [0.25, 0.25, 0.5],
-    ],
-)
 @pytest.mark.parametrize("dtype", [target_dtype])
 @pytest.mark.parametrize("max_tokens", [128])
 @pytest.mark.parametrize("num_logprobs", [10])
@@ -441,7 +417,6 @@ def test_qwen2_vl_video_embeddings_input(
     vllm_runner,
     video_assets,
     model,
-    size_factors,
     dtype: str,
     max_tokens: int,
     num_logprobs: int,
@@ -458,6 +433,7 @@ def test_qwen2_vl_video_embeddings_input(
             [],
             [rescale_video_size(video, factor) for factor in size_factors],
         )
+        for size_factors in VIDEO_SIZE_FACTOR_GROUPS
         for video, prompt in zip(sampled_vids, VIDEO_PROMPTS)
     ]
 

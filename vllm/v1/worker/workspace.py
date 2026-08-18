@@ -3,9 +3,11 @@
 
 import inspect
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from itertools import accumulate
 from math import prod
-from typing import Optional
 
 import torch
 
@@ -26,21 +28,44 @@ _MB = 1024**2
 _GiB = 1024**3
 
 # Global workspace manager instance
-_manager: Optional["WorkspaceManager"] = None
+_manager: "WorkspaceManager | None" = None
+_workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+
+
+@contextmanager
+def use_workspace_lane(lane: int) -> Iterator[None]:
+    """Select an independent workspace owner for this execution context."""
+    if lane < 0:
+        raise ValueError(f"Workspace lane must be non-negative, got {lane}.")
+    token = _workspace_lane.set(lane)
+    try:
+        yield
+    finally:
+        _workspace_lane.reset(token)
 
 
 class WorkspaceManager:
     """Manager for workspace allocation.
 
-    Manages workspace buffers for DBO (Dual Batch Overlap) execution.
+    Manages one workspace buffer per active ``(ubatch, lane)`` slot.
     Can be locked to prevent further growth during execution.
     """
 
-    def __init__(self, device: torch.device, num_ubatches: int | None = None):
+    def __init__(
+        self,
+        device: torch.device,
+        num_ubatches: int | None = None,
+        num_lanes: int = 1,
+    ):
         self._device = device
         # Cache num ubatches at init based on configuration (default to 1)
         self._num_ubatches = num_ubatches if num_ubatches is not None else 1
-        self._current_workspaces: list[torch.Tensor | None] = [None, None]
+        if num_lanes < 1:
+            raise ValueError(f"num_lanes must be at least one, got {num_lanes}.")
+        self._num_lanes = num_lanes
+        self._current_workspaces: list[torch.Tensor | None] = [None] * (
+            self._num_ubatches * self._num_lanes
+        )
         self._locked: bool = False
 
     @staticmethod
@@ -60,6 +85,23 @@ class WorkspaceManager:
         if envs.VLLM_DEBUG_WORKSPACE:
             logger.info(
                 "[WORKSPACE DEBUG] Workspace locked. Current sizes: %s",
+                [
+                    self._workspace_size_bytes(ws) / _MB
+                    for ws in self._current_workspaces
+                    if ws is not None
+                ],
+            )
+
+    def unlock(self) -> None:
+        """Unlock the workspace to allow growth.
+
+        This is used during elastic EP scaling when the workspace size
+        needs to grow due to changes in the number of experts.
+        """
+        self._locked = False
+        if envs.VLLM_DEBUG_WORKSPACE:
+            logger.info(
+                "[WORKSPACE DEBUG] Workspace unlocked. Current sizes: %s",
                 [
                     self._workspace_size_bytes(ws) / _MB
                     for ws in self._current_workspaces
@@ -108,7 +150,14 @@ class WorkspaceManager:
             The current workspace tensor.
         """
         ubatch_id = dbo_current_ubatch_id()
-        current_workspace = self._current_workspaces[ubatch_id]
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        workspace_id = ubatch_id * self._num_lanes + lane
+        current_workspace = self._current_workspaces[workspace_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
         if current_size < required_bytes:
@@ -143,35 +192,33 @@ class WorkspaceManager:
                     "Workspace growth is not allowed after locking."
                 )
 
-            for ubatch_id in range(self._num_ubatches):
-                current_workspace = self._current_workspaces[ubatch_id]
-                if (
-                    current_workspace is None
-                    or self._workspace_size_bytes(current_workspace) < required_bytes
-                ):
-                    # Delete old tensor before allocating new one to avoid
-                    # memory spike from resize_(). resize_() allocates new
-                    # memory before freeing old, which can cause OOM.
-                    # Must clear the list reference first since local var
-                    # is just a copy of the reference.
-                    self._current_workspaces[ubatch_id] = None
-                    del current_workspace
-                    self._current_workspaces[ubatch_id] = torch.empty(
-                        (required_bytes,), dtype=torch.uint8, device=self._device
-                    )
+            # Only resize the requesting ubatch/lane workspace. Other slots
+            # resize lazily on their next get_simultaneous call.
+            # Resizing all ubatches here would orphan the other ubatch's
+            # old tensor when it still holds views into it (DBO leak).
+            self._current_workspaces[workspace_id] = None
+            del current_workspace
+            # Release the freed segment back to CUDA so the caching
+            # allocator can reuse the GPU memory for the larger
+            # allocation below. Without this, each resize may leave a
+            # dead segment in reserved memory which can cause higher peak
+            # memory usage.
+            torch.accelerator.empty_cache()
+            self._current_workspaces[workspace_id] = torch.empty(
+                (required_bytes,), dtype=torch.uint8, device=self._device
+            )
+            current_workspace = self._current_workspaces[workspace_id]
 
             if envs.VLLM_DEBUG_WORKSPACE:
                 logger.info(
                     "[WORKSPACE DEBUG] Resized workspace from '%s': %.2f MB -> "
-                    "%.2f MB (%d ubatches, total memory %.2f MB)",
+                    "%.2f MB (ubatch %d, lane %d)",
                     get_caller_info(),
                     current_size / _MB,
                     required_bytes / _MB,
-                    self._num_ubatches,
-                    required_bytes * self._num_ubatches / _MB,
+                    ubatch_id,
+                    lane,
                 )
-
-            current_workspace = self._current_workspaces[dbo_current_ubatch_id()]
 
         return current_workspace
 
@@ -199,7 +246,9 @@ def current_workspace_manager() -> "WorkspaceManager":
 
 
 def init_workspace_manager(
-    device: torch.device, num_ubatches: int | None = None
+    device: torch.device,
+    num_ubatches: int | None = None,
+    num_lanes: int = 1,
 ) -> None:
     """Initialize the workspace manager with a device.
 
@@ -208,7 +257,8 @@ def init_workspace_manager(
 
     Args:
         device: The device to allocate workspace on.
-        num_ubatches: Number of micro-batches. Defaults to 1.
+        num_ubatches: Number of workspace ubatch slots. Defaults to 1.
+        num_lanes: Number of independent execution lanes per ubatch. Defaults to 1.
     """
     global _manager
     if _manager is not None:
@@ -218,7 +268,7 @@ def init_workspace_manager(
             _manager._device,
             device,
         )
-    _manager = WorkspaceManager(device, num_ubatches)
+    _manager = WorkspaceManager(device, num_ubatches, num_lanes)
 
 
 def lock_workspace() -> None:
@@ -241,6 +291,17 @@ def lock_workspace() -> None:
         # Now all get_workspace calls must fit in pre-allocated size
     """
     current_workspace_manager().lock()
+
+
+def unlock_workspace() -> None:
+    """Unlock the workspace to allow growth.
+
+    This is used during elastic EP scaling when the workspace size
+    needs to grow due to changes in the number of experts.
+    After scaling operations complete, lock_workspace() should be
+    called again to prevent unexpected allocations.
+    """
+    current_workspace_manager().unlock()
 
 
 def reset_workspace_manager() -> None:

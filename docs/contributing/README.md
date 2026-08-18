@@ -43,13 +43,26 @@ If you are only developing vLLM's Python code, install vLLM using:
 VLLM_USE_PRECOMPILED=1 uv pip install -e .
 ```
 
+To rebuild only the Rust frontend binary:
+
+```bash
+./build_rust.sh          # release build
+./build_rust.sh --debug  # faster build for development
+```
+
 If you are developing vLLM's Python and CUDA/C++ code, install Pytorch first:
 
 ```bash
 uv pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
-then install vLLM using:
+Then install the necessary build dependencies from `requirements/build/cuda.txt`, skipping `torch` as it was installed in the previous step:
+
+```bash
+grep -v '^torch==' requirements/build/cuda.txt | uv pip install -r -
+```
+
+Finally install vLLM using:
 
 ```bash
 uv pip install -e . --no-build-isolation
@@ -58,6 +71,7 @@ uv pip install -e . --no-build-isolation
 For more details about installing from source and installing for other hardware, check out the [installation instructions](../getting_started/installation/README.md) for your hardware and head to the "Build wheel from source" section.
 
 For an optimized workflow when iterating on C++/CUDA kernels, see the [Incremental Compilation Workflow](./incremental_build.md) for recommendations.
+For JIT kernel warmup conventions, see [JIT Kernel Warmup](./jit_kernel_warmup.md).
 
 !!! tip
     vLLM is compatible with Python versions 3.10 to 3.13. However, vLLM's default [Dockerfile](../../docker/Dockerfile) ships with Python 3.12 and tests in CI (except `mypy`) are run with Python 3.12.
@@ -69,7 +83,7 @@ For an optimized workflow when iterating on C++/CUDA kernels, see the [Increment
 vLLM uses `pre-commit` to lint and format the codebase. See <https://pre-commit.com/#usage> if `pre-commit` is new to you. Setting up `pre-commit` is as easy as:
 
 ```bash
-uv pip install pre-commit
+uv pip install pre-commit>=4.5.1
 pre-commit install
 ```
 
@@ -88,8 +102,7 @@ vLLM's `pre-commit` hooks will now run automatically every time you commit.
     Some `pre-commit` hooks only run in CI. If you need to, you can run them locally with:
 
     ```bash
-    pre-commit run --hook-stage manual markdownlint
-    pre-commit run --hook-stage manual mypy-3.10
+    pre-commit run --hook-stage manual mypy-3.11
     ```
 
 ### Documentation
@@ -182,6 +195,30 @@ Using `-s` with `git commit` will automatically add this header.
     - **VSCode**: Open the [Settings editor](https://code.visualstudio.com/docs/configure/settings)
       and enable the `Git: Always Sign Off` (`git.alwaysSignOff`) field.
 
+### AI Assisted Contributions
+
+Before making an AI assisted contribution, you must:
+
+1. **Be involved**: Do not submit "pure agent" PRs. The human submitter is responsible for reviewing all changed lines, validating behavior end-to-end, and running relevant tests.
+2. **Ensure significance**: Avoid one-off "busywork" PRs (single typo, isolated style cleanup, one mutable default fix, etc.). Bundle mechanical cleanups into a clear, systematic scope.
+
+When AI tools provide non-trivial assistance in generating or modifying code, you must:
+
+1. **Review thoroughly**: You remain responsible for all code you submit. Review and understand AI-generated code with the same care as code you write manually.
+2. **Disclose in PR**: Always mention when a pull request includes AI-generated code. Add a note in the PR description.
+3. **Mark commits**: Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`). For example:
+
+   ```text
+   Your commit message here
+
+   Co-authored-by: GitHub Copilot
+   Co-authored-by: Claude
+   Co-authored-by: gemini-code-assist
+   Signed-off-by: Your Name <your.email@example.com>
+   ```
+
+AI-assisted code must meet all quality standards: proper testing, documentation, adherence to style guides, and thorough review. Attribution helps reviewers evaluate contributions in context and maintains legal clarity for the project.
+
 ### PR Title and Classification
 
 Only specific types of PRs will be reviewed. The PR title is prefixed
@@ -265,8 +302,28 @@ review process:
   isn't clear or you disagree with a suggestion, feel free to ask for
   clarification or discuss the suggestion.
 - Note that not all CI checks will be executed due to limited computational
-  resources. The reviewer will add `ready` label to the PR when the PR is
-  ready to merge or a full CI run is needed.
+  resources. Reviewers with write access and configured trusted contributors
+  can comment `/ci run` when CI signals are needed before a PR is ready. After
+  the PR is approved or has the `ready` label, the PR author can use `/ci run`
+  or `/ci retry`. New commits do not start CI automatically.
+
+### Pull Request Limits and Escalation
+
+vLLM uses GitHub's [pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/)
+for contributors without write access. The current cap is 6 open PRs. If this
+blocks well-intentioned critical work, contact a committer to request bypass
+list access.
+
+If you need an expedited review for an important contribution, please email us
+at:
+
+<pr-review-request@vllm.ai>
+
+Using a verifiable company or university email, include:
+
+- your production or research use case
+- the problem you encountered
+- how your contribution addresses it
 
 ## Thank You
 

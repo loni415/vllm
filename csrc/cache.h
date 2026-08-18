@@ -7,7 +7,13 @@
 #include <vector>
 
 void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
+                 int64_t block_size_in_bytes,
                  const torch::Tensor& block_mapping);
+
+void swap_blocks_batch(const torch::Tensor& src_ptrs,
+                       const torch::Tensor& dst_ptrs,
+                       const torch::Tensor& sizes,
+                       bool is_src_access_order_any);
 
 void reshape_and_cache(torch::Tensor& key, torch::Tensor& value,
                        torch::Tensor& key_cache, torch::Tensor& value_cache,
@@ -61,9 +67,8 @@ void cp_gather_and_upconvert_fp8_kv_cache(
     torch::Tensor const& src_cache,         // [NUM_BLOCKS, BLOCK_SIZE, 656]
     torch::Tensor const& dst,               // [TOT_TOKENS, 576]
     torch::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
-    torch::Tensor const& seq_lens,          // [BATCH]
     torch::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size);
+    int64_t batch_size, std::optional<torch::Tensor> seq_starts = std::nullopt);
 
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(
@@ -72,6 +77,12 @@ void indexer_k_quant_and_cache(
     torch::Tensor& slot_mapping,  // [num_tokens]
     int64_t quant_block_size,     // quantization block size
     const std::string& scale_fmt);
+
+// Concatenate query nope and rope for MLA/DSA attention
+void concat_mla_q(
+    torch::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]
+    torch::Tensor& q_pe,     // [num_tokens, num_heads, rope_dim]
+    torch::Tensor& q_out);   // [num_tokens, num_heads, nope_dim + rope_dim]
 
 // Extract function to gather quantized K cache
 void cp_gather_indexer_k_quant_cache(

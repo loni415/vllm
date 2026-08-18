@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from collections import UserDict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,18 +19,18 @@ import numpy as np
 import torch
 from typing_extensions import assert_never
 
+from vllm.inputs import ModalityData, MultiModalDataDict, MultiModalUUIDDict
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import LazyLoader
 
 from .audio import AudioResampler, AudioSpec, normalize_audio
+from .image import convert_image_mode, normalize_image
 from .inputs import (
     AudioItem,
     HfAudioItem,
     HfImageItem,
     HfVideoItem,
     ImageItem,
-    ModalityData,
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
     VideoItem,
@@ -40,8 +40,18 @@ from .media import MediaWithBytes
 _T = TypeVar("_T")
 _I = TypeVar("_I")
 
+EmbeddingFieldRole: TypeAlias = Literal["values", "metadata"]
+"""What a field of a pre-computed-embedding input carries.
+
+`"values"` is the embedding tensor itself; `"metadata"` is a key that sizes the
+prompt's placeholder range. The distinction is what lets one declaration serve
+both an ordinary request (everything present) and an EC consumer (embeddings
+arrive through the connector, metadata still in the request).
+"""
+
 if TYPE_CHECKING:
     import PIL.Image as PILImage
+
 else:
     PILImage = LazyLoader("PILImage", globals(), "PIL.Image")
 
@@ -250,34 +260,62 @@ class DictEmbeddingItems(
         self,
         data: Mapping[str, torch.Tensor],
         modality: str,
-        required_fields: set[str],
+        required_fields: Set[str],
         fields_factory: Callable[
             [Mapping[str, torch.Tensor]],
             Mapping[str, MultiModalFieldConfig],
         ],
+        optional_fields: Set[str] = frozenset(),
     ) -> None:
+        """
+        Args:
+            data: The dictionary of tensors for this modality.
+            modality: The modality these items belong to.
+            required_fields: Fields `data` must contain.
+            fields_factory: Builds the field config from the data.
+            optional_fields: Fields `data` may omit. Which fields these are is
+                the caller's decision -- see
+                `MultiModalDataParser.embedding_field_sets`, where a deployment
+                that receives embeddings through an EC connector makes the
+                embeddings optional. They still need a field config, since they
+                are used whenever they *are* supplied.
+        """
         from transformers.feature_extraction_utils import BatchFeature
 
         super().__init__(data, modality)
 
-        missing_required_data_keys = required_fields - data.keys()
+        # Nothing required would leave nothing to size the placeholder range
+        # from, so the item would parse into zero entries and silently produce a
+        # wrong prompt instead of failing here.
+        if not required_fields:
+            raise ValueError(
+                f"Cannot parse {modality!r} embeddings: every declared field is "
+                f"optional ({sorted(optional_fields)}), so nothing is left to "
+                "size the placeholder range."
+            )
+
+        declared_fields = set(required_fields) | set(optional_fields)
+
+        missing_required_data_keys = set(required_fields) - data.keys()
         if missing_required_data_keys:
             data_keys = set(data.keys())
             msg = (
-                f"The data should contain the fields: {required_fields}, "
+                f"The data should contain the fields: {set(required_fields)}, "
                 f"but only found the following keys: {data_keys}"
             )
             raise ValueError(msg)
 
         fields_config = fields_factory(data)
-        missing_required_fields = required_fields - fields_config.keys()
+        # Check every declared field, not just the required ones: an optional
+        # field still needs a config for when it is supplied.
+        missing_required_fields = declared_fields - fields_config.keys()
         if missing_required_fields:
             fields = set(fields_config.keys())
-            msg = f"{required_fields=} should be a subset of {fields=}"
+            msg = f"{declared_fields=} should be a subset of {fields=}"
             raise ValueError(msg)
 
         self.fields_config = fields_config
-        self.required_fields = required_fields
+        self.required_fields = set(required_fields)
 
         self._kwargs = MultiModalKwargsItems.from_hf_inputs(
             BatchFeature(dict(data)),
@@ -297,14 +335,15 @@ class DictEmbeddingItems(
         return self.data
 
 
-class AudioProcessorItems(ProcessorBatchItems[HfAudioItem]):
-    def __init__(self, data: Sequence[HfAudioItem] | None) -> None:
-        if data is None:
-            data = [None]
+class AudioProcessorItems(ProcessorBatchItems[HfAudioItem | None]):
+    def __init__(self, data: Sequence[HfAudioItem | None]) -> None:
         super().__init__(data, "audio")
 
     def get_audio_length(self, item_idx: int) -> int:
         audio = self.get(item_idx)
+        if audio is None:
+            raise ValueError(f"Cannot get length of cached audio at {item_idx}")
+
         return len(audio)
 
 
@@ -322,19 +361,25 @@ class ImageSize(NamedTuple):
     height: int
 
 
-class ImageProcessorItems(ProcessorBatchItems[HfImageItem]):
-    def __init__(self, data: Sequence[HfImageItem] | None) -> None:
-        if data is None:
-            data = [None]
+class ImageProcessorItems(ProcessorBatchItems[HfImageItem | None]):
+    def __init__(self, data: Sequence[HfImageItem | None]) -> None:
         super().__init__(data, "image")
 
     def get_image_size(self, item_idx: int) -> ImageSize:
         image = self.get(item_idx)
+        if image is None:
+            raise ValueError(f"Cannot get size of cached image at {item_idx}")
 
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
         if isinstance(image, (np.ndarray, torch.Tensor)):
-            _, h, w = image.shape
+            if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+                # HWC format (e.g. from np.array(PIL.Image)).
+                # PIL images are always channels-last.
+                h, w = image.shape[0], image.shape[1]
+            else:
+                # CHW format (standard PyTorch / numpy convention).
+                _, h, w = image.shape
             return ImageSize(w, h)
 
         assert_never(image)
@@ -349,27 +394,57 @@ class ImageEmbeddingItems(EmbeddingItems):
         super().__init__(data, "image", expected_hidden_size)
 
 
-class VideoProcessorItems(ProcessorBatchItems[HfVideoItem]):
+class VideoProcessorItems(ProcessorBatchItems[HfVideoItem | None]):
     def __init__(
         self,
-        data: Sequence[HfVideoItem] | None,
+        data: Sequence[HfVideoItem | None],
         metadata: dict[str, Any] | list[dict[str, Any] | None] | None = None,
     ) -> None:
-        if data is None:
-            data = [None]
         super().__init__(data, "video")
+
         self.metadata = metadata
 
+    def _unwrap(self, item: Any) -> Any:
+        if isinstance(item, tuple):
+            frames, metadata = item
+            return super()._unwrap(frames), metadata
+        return super()._unwrap(item)
+
+    def get_item_for_hash(self, index: int) -> Any:
+        item = self.data[index]
+        if isinstance(item, MediaWithBytes) and isinstance(self.metadata, list):
+            metadata = self.metadata[index]
+            if metadata is not None:
+                return item, metadata
+        return item
+
     def get_num_frames(self, item_idx: int) -> int:
-        return len(self.get(item_idx))
+        video = self.get(item_idx)
+        if video is None:
+            raise ValueError(f"Cannot get length of cached video at {item_idx}")
+
+        return len(video)
 
     def get_frame_size(self, item_idx: int) -> ImageSize:
-        image = self.get(item_idx)[0]  # Assume that the video isn't empty
+        video = self.get(item_idx)
+        if video is None:
+            raise ValueError(f"Cannot get size of cached video at {item_idx}")
+        if len(video) == 0:
+            raise ValueError(f"Cannot get size of empty video at {item_idx}")
+
+        image = video[0]
 
         if isinstance(image, PILImage.Image):
             return ImageSize(*image.size)
         if isinstance(image, (np.ndarray, torch.Tensor)):
-            _, h, w = image.shape
+            if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+                # HWC format (e.g. from np.array(PIL.Image) via
+                # _get_video_with_metadata).  PIL images are always
+                # channels-last.
+                h, w = image.shape[0], image.shape[1]
+            else:
+                # CHW format (standard PyTorch / numpy convention).
+                _, h, w = image.shape
             return ImageSize(w, h)
 
         assert_never(image)
@@ -384,14 +459,30 @@ class VideoEmbeddingItems(EmbeddingItems):
         super().__init__(data, "video", expected_hidden_size)
 
 
+class VisionChunkProcessorItems(ProcessorBatchItems[Any]):
+    """Processor items for vision chunks (unified image and video chunks)."""
+
+    def __init__(self, data: Sequence[Any]) -> None:
+        super().__init__(data, "vision_chunk")
+
+
 _D = TypeVar("_D", bound=ModalityDataItems[Any, Any])
 
 
 class MultiModalDataItems(UserDict[str, ModalityDataItems[Any, Any]]):
     """
-    As [`MultiModalDataDict`][vllm.multimodal.inputs.MultiModalDataDict], but
-    normalized such that each entry corresponds to a list.
+    A normalized [`MultiModalDataDict`][vllm.inputs.MultiModalDataDict]
+    such that each entry corresponds to a list.
     """
+
+    def select(self, modalities: Set[str]):
+        """
+        Construct a new `MultiModalDataItems` instance containing only the
+        selected modalities.
+        """
+        return MultiModalDataItems(
+            {modality: self[modality] for modality in modalities}
+        )
 
     def get_count(self, modality: str, *, strict: bool = True) -> int:
         """
@@ -450,7 +541,7 @@ ModalityDataParser: TypeAlias = Callable[
 
 class MultiModalDataParser:
     """
-    Parses [`MultiModalDataDict`][vllm.multimodal.inputs.MultiModalDataDict]
+    Parses [`MultiModalDataDict`][vllm.inputs.MultiModalDataDict]
     into [`MultiModalDataItems`][vllm.multimodal.parse.MultiModalDataItems].
 
     Args:
@@ -463,18 +554,63 @@ class MultiModalDataParser:
             embedding inputs. If provided, validates that user-supplied
             embeddings have the correct hidden size to prevent crashes
             during model inference.
+        embeds_from_ec_connector (bool): Whether pre-computed embeddings may be
+            absent from the request because an encode/prefill/decode encoder
+            instance publishes them through an EC connector instead. Derived by
+            `BaseProcessingInfo.embeds_from_ec_connector`.
     """
+
+    embedding_fields: Mapping[str, Mapping[str, EmbeddingFieldRole]] = {}
+    """Per-modality field roles for pre-computed-embedding inputs.
+
+    Declared here rather than inside `_parse_*_data` so an EC producer can read
+    it too: on a producer the request carries real media, so the branch that
+    builds `DictEmbeddingItems` never runs, yet the producer still has to know
+    which processed keys to publish. One declaration, both sides, no drift.
+
+    A modality absent from this mapping can only be sent whole in the request.
+    """
+
+    @classmethod
+    def placeholder_metadata_fields(cls, modality: str) -> set[str]:
+        """The keys that size `modality`'s placeholder range.
+
+        What an EC producer publishes alongside the embedding, and what a
+        consumer keeps requiring once the embedding itself is gone.
+        """
+        return {
+            field
+            for field, role in cls.embedding_fields.get(modality, {}).items()
+            if role == "metadata"
+        }
+
+    def embedding_field_sets(self, modality: str) -> tuple[set[str], set[str]]:
+        """`modality`'s (required, optional) fields for this deployment.
+
+        Resolves the static roles in `embedding_fields` against where the
+        embeddings actually come from: on an EC consumer they arrive through the
+        connector, so the request may omit them; anywhere else a request that
+        claims to carry pre-computed embeddings has to actually carry them.
+        """
+        metadata = self.placeholder_metadata_fields(modality)
+        values = set(self.embedding_fields.get(modality, {})) - metadata
+        if self.embeds_from_ec_connector:
+            return metadata, values
+        return metadata | values, set()
 
     def __init__(
         self,
         *,
         target_sr: float | None = None,
         target_channels: int | None = None,
-        audio_resample_method: Literal["librosa", "scipy"] = "librosa",
+        audio_resample_method: Literal["pyav", "scipy", "soxr"] = "pyav",
         video_needs_metadata: bool = False,
         expected_hidden_size: int | None = None,
+        embeds_from_ec_connector: bool = False,
     ) -> None:
         super().__init__()
+
+        self.embeds_from_ec_connector = embeds_from_ec_connector
 
         self.audio_resampler = AudioResampler(
             target_sr=target_sr,
@@ -490,16 +626,8 @@ class MultiModalDataParser:
     ) -> TypeGuard[torch.Tensor | list[torch.Tensor]]:
         if isinstance(data, torch.Tensor):
             return data.ndim == 3
-        if is_list_of(data, torch.Tensor):
+        if is_list_of(data, torch.Tensor) and len(data) > 0:
             return data[0].ndim == 2  # type: ignore[index]
-
-        return False
-
-    def _is_empty(self, data: object) -> TypeGuard[None]:
-        if isinstance(data, list):
-            return len(data) == 0
-        if isinstance(data, (np.ndarray, torch.Tensor)):
-            return data.size == 0
 
         return False
 
@@ -521,7 +649,10 @@ class MultiModalDataParser:
     def _get_video_with_metadata(
         self,
         video: VideoItem,
-    ) -> tuple[np.ndarray, dict[str, Any] | None]:
+    ) -> tuple[np.ndarray | MediaWithBytes[np.ndarray], dict[str, Any] | None]:
+        if isinstance(video, MediaWithBytes):
+            new_video, metadata = self._get_video_with_metadata(video.media)
+            return MediaWithBytes(new_video, video.original_bytes), metadata
         if isinstance(video, tuple):
             return video
         if isinstance(video, list):
@@ -538,12 +669,6 @@ class MultiModalDataParser:
         data: ModalityData[AudioItem],
     ) -> ModalityDataItems[Any, Any] | None:
         if data is None:
-            return AudioProcessorItems(None)
-
-        # also check single audio item with sampling rate
-        if self._is_empty(data) or (
-            isinstance(data, tuple) and self._is_empty(data[0])
-        ):
             return None
 
         if self.is_embeddings(data):
@@ -551,9 +676,8 @@ class MultiModalDataParser:
 
         data_items: list[AudioItem]
         if (
-            is_list_of(data, float)
-            or isinstance(data, (np.ndarray, torch.Tensor))
-            and data.ndim == 1
+            (is_list_of(data, float) and len(data) > 0)
+            or (isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 1)
             or isinstance(data, tuple)
         ):
             data_items = [data]
@@ -584,24 +708,26 @@ class MultiModalDataParser:
         data: ModalityData[ImageItem],
     ) -> ModalityDataItems[Any, Any] | None:
         if data is None:
-            return ImageProcessorItems(None)
-
-        if self._is_empty(data):
             return None
 
         if self.is_embeddings(data):
             return ImageEmbeddingItems(data, self.expected_hidden_size)
 
-        if (
-            isinstance(data, (PILImage.Image, MediaWithBytes))
-            or isinstance(data, (np.ndarray, torch.Tensor))
-            and data.ndim == 3
+        if isinstance(data, (PILImage.Image, MediaWithBytes)) or (
+            isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 3
         ):
             data_items = [data]
         elif isinstance(data, (np.ndarray, torch.Tensor)):
             data_items = [elem for elem in data]
         else:
             data_items = data
+
+        data_items = [
+            convert_image_mode(normalize_image(item), "RGB")
+            if isinstance(item, PILImage.Image)
+            else item
+            for item in data_items
+        ]
 
         return ImageProcessorItems(data_items)
 
@@ -610,19 +736,14 @@ class MultiModalDataParser:
         data: ModalityData[VideoItem],
     ) -> ModalityDataItems[Any, Any] | None:
         if data is None:
-            return VideoProcessorItems(None)
-
-        if self._is_empty(data):
             return None
 
         if self.is_embeddings(data):
             return VideoEmbeddingItems(data, self.expected_hidden_size)
 
         data_items: list[VideoItem]
-        if (
-            is_list_of(data, PILImage.Image)
-            or isinstance(data, (np.ndarray, torch.Tensor))
-            and data.ndim == 4
+        if (is_list_of(data, PILImage.Image) and len(data) > 0) or (
+            isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 4
         ):
             data_items = [data]
         elif isinstance(data, (np.ndarray, torch.Tensor)):
@@ -632,7 +753,11 @@ class MultiModalDataParser:
         else:
             data_items = data  # type: ignore[assignment]
 
-        new_videos = list[tuple[np.ndarray, dict[str, Any] | None]]()
+        new_videos = list[
+            np.ndarray
+            | MediaWithBytes[np.ndarray]
+            | tuple[np.ndarray | MediaWithBytes[np.ndarray], dict[str, Any]]
+        ]()
         metadata_lst: list[dict[str, Any] | None] = []
         for data_item in data_items:
             video, metadata = self._get_video_with_metadata(data_item)
@@ -643,20 +768,34 @@ class MultiModalDataParser:
                         "Please check your video input in `multi_modal_data`"
                     )
                 new_videos.append((video, metadata))
-                metadata_lst.append(metadata)
             else:
                 new_videos.append(video)
-
-        if not self.video_needs_metadata:
-            metadata = None
+            metadata_lst.append(metadata)
 
         return VideoProcessorItems(new_videos, metadata=metadata_lst)
+
+    def _parse_vision_chunk_data(
+        self,
+        data: ModalityData[Any],
+    ) -> ModalityDataItems[Any, Any] | None:
+        """Parse vision chunk data (unified image and video chunks)."""
+        if data is None:
+            return None
+
+        if self.is_embeddings(data):
+            raise ValueError("Do not support embedding data for vision_chunk right now")
+
+        if isinstance(data, dict):
+            data = [data]
+
+        return VisionChunkProcessorItems(data)
 
     def _get_subparsers(self) -> Mapping[str, ModalityDataParser]:
         return {
             "audio": self._parse_audio_data,
             "image": self._parse_image_data,
             "video": self._parse_video_data,
+            "vision_chunk": self._parse_vision_chunk_data,
         }
 
     def parse_mm_data(self, mm_data: MultiModalDataDict) -> MultiModalDataItems:
@@ -672,3 +811,20 @@ class MultiModalDataParser:
                 mm_items[k] = parsed_data
 
         return mm_items
+
+
+MultiModalUUIDItems: TypeAlias = dict[str, Sequence[str | None]]
+"""
+A normalized [`MultiModalUUIDDict`][vllm.inputs.MultiModalUUIDDict]
+such that each entry corresponds to a list.
+"""
+
+
+def parse_mm_uuids(mm_uuids: MultiModalUUIDDict | None) -> MultiModalUUIDItems:
+    if mm_uuids is None:
+        return {}
+
+    return {
+        modality: [uuids] if isinstance(uuids, str) else uuids
+        for modality, uuids in mm_uuids.items()
+    }

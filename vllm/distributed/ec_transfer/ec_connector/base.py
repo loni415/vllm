@@ -20,6 +20,8 @@ The class provides the following primitives:
 
         get_finished() - called with ids of finished requests, returns
             ids of requests that have completed async sending/recving.
+        build_connector_worker_meta() - builds metadata to be sent
+            back to the scheduler-side connector
 """
 
 import enum
@@ -56,6 +58,27 @@ class ECConnectorMetadata(ABC):  # noqa: B024
     pass
 
 
+class ECConnectorWorkerMetadata(ABC):
+    """
+    Abstract Metadata used to communicate back
+    Worker ECConnector -> Scheduler ECConnector.
+
+    Each worker can output its own metadata.
+    For a single engine step, all metadata objects returned by workers
+    will be aggregated using the `aggregate` method below, before
+    being passed to the Scheduler ECConnector.
+    """
+
+    @abstractmethod
+    def aggregate(
+        self, other: "ECConnectorWorkerMetadata"
+    ) -> "ECConnectorWorkerMetadata":
+        """
+        Aggregate metadata with another `ECConnectorWorkerMetadata` object.
+        """
+        pass
+
+
 class ECConnectorBase(ABC):
     def __init__(self, vllm_config: "VllmConfig", role: ECConnectorRole):
         self._connector_metadata: ECConnectorMetadata | None = None
@@ -63,6 +86,7 @@ class ECConnectorBase(ABC):
         self._role = role
         if vllm_config.ec_transfer_config is not None:
             self._is_producer = vllm_config.ec_transfer_config.is_ec_producer
+            self._is_consumer = vllm_config.ec_transfer_config.is_ec_consumer
         else:
             raise ValueError("ec_transfer_config must be set for ECConnectorBase")
 
@@ -73,6 +97,18 @@ class ECConnectorBase(ABC):
     @property
     def is_producer(self) -> bool:
         return self._is_producer
+
+    @property
+    def is_consumer(self) -> bool:
+        return self._is_consumer
+
+    def shutdown(self) -> None:
+        """
+        Shutdown the connector. This is called when the process
+        is shutting down to ensure that all the async operations are
+        completed and the connector is cleaned up properly.
+        """
+        return None
 
     # ==============================
     # Worker-side methods
@@ -177,26 +213,53 @@ class ECConnectorBase(ABC):
         """
         return None, None
 
+    def build_connector_worker_meta(self) -> ECConnectorWorkerMetadata | None:
+        """
+        Build the ECConnector worker metadata for this engine step.
+
+        Returns:
+            ECConnectorWorkerMetadata: the worker metadata.
+            None if no worker metadata is available.
+        """
+        return None
+
     # ==============================
     # Scheduler-side methods
     # ==============================
 
     @abstractmethod
-    def has_caches(
+    def has_cache_item(
         self,
-        request: "Request",
-    ) -> list[bool]:
+        identifier: str,
+    ) -> bool:
         """
-        Check if encoder cache exists for each mm data of requests
+        Check if a single encoder cache exists
 
         Args:
-            request (Request): the request object.
+            identifier (str): the identifier of the media.
 
         Returns:
-            A list bool where ith value is True if cache exist for
-            ith mm_data of requests
+            A bool where value is True if cache exist for
+            the media
         """
         pass
+
+    def ensure_cache_available(
+        self, request: "Request", num_computed_tokens: int
+    ) -> bool:
+        """
+        Ensure encoder cache items are available for the given request.
+        May initiate asynchronous transfers for items not yet local.
+
+        Args:
+            request: the request whose multimodal features to check.
+            num_computed_tokens: tokens already covered by cached KV blocks.
+
+        Returns:
+            True if all items are ready or no transfer is needed.
+            False if any items are still in transit (request should be deferred).
+        """
+        return True
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request", index: int):
@@ -245,3 +308,15 @@ class ECConnectorBase(ABC):
             get_finished().
         """
         return False, None
+
+    def has_pending_push_work(self) -> bool:
+        """Return True if the connector has push-mode work that requires
+        the engine main loop to keep stepping (e.g. for EPD,
+        Producer has push work when Xfer is in progress - Consumer
+        is reading it).
+        This mirrors exactly the KV Connector's has_pending_push_work().
+
+        Connectors that don't implement push-based EC transfer should
+        leave this as False.
+        """
+        return False

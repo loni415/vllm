@@ -11,11 +11,11 @@ from transformers import BatchFeature, LlavaNextVideoConfig, LlavaNextVideoProce
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.models.clip import CLIPVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -36,8 +36,14 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from .llava import init_vision_tower_for_llava
+from .module_mapping import MultiModelKeys
 from .siglip import SiglipVisionModel
 from .utils import (
     AutoWeightsLoader,
@@ -165,7 +171,7 @@ class LlavaNextVideoDummyInputsBuilder(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_videos = mm_counts.get("video", 0)
 
@@ -174,7 +180,7 @@ class LlavaNextVideoDummyInputsBuilder(
             seq_len, mm_counts
         )
 
-        video_overrides = mm_options.get("video") if mm_options else None
+        video_overrides = mm_options.get("video")
 
         return {
             "video": self._get_dummy_videos(
@@ -298,7 +304,14 @@ class LlavaNextMultiModalProjector(nn.Module):
     info=LlavaNextVideoProcessingInfo,
     dummy_inputs=LlavaNextVideoDummyInputsBuilder,
 )
-class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class LlavaNextVideoForConditionalGeneration(
+    nn.Module, SupportsLoRA, SupportsMultiModal, SupportsPP
+):
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # mapping for new names in checkpoint saved after transformers v4.52
@@ -312,12 +325,10 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("image"):
-            return "<image>"
         if modality.startswith("video"):
             return "<video>"
 
-        raise ValueError("Only image or video modality is supported")
+        raise ValueError("Only video modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -329,26 +340,34 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.config = config
         self.multimodal_config = multimodal_config
 
-        # Initialize the vision tower only up to the required feature layer
-        self.vision_tower = init_vision_tower_for_llava(
-            config,
-            quant_config=quant_config,
-            multimodal_config=multimodal_config,
-            require_post_norm=False,
-            prefix=maybe_prefix(prefix, "vision_tower"),
+        vision_encoder_info = get_vision_encoder_info(config)
+        self.patch_grid_length = vision_encoder_info.get_patch_grid_length()
+        self.pooled_grid_length = math.ceil(
+            self.patch_grid_length / config.spatial_pool_stride
         )
-        self.vision_resampler = LlavaNextVideoPooler(config)
-        self.multi_modal_projector = LlavaNextMultiModalProjector(
-            vision_hidden_size=config.vision_config.hidden_size,
-            text_hidden_size=config.text_config.hidden_size,
-            projector_hidden_act=config.projector_hidden_act,
-            multimodal_projector_bias=config.multimodal_projector_bias,
-        )
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
+
+        with self._mark_tower_model(vllm_config, "video"):
+            # Initialize the vision tower only up to the required feature layer
+            self.vision_tower = init_vision_tower_for_llava(
+                config,
+                quant_config=quant_config,
+                require_post_norm=False,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
+            self.vision_resampler = LlavaNextVideoPooler(config)
+            self.multi_modal_projector = LlavaNextMultiModalProjector(
+                vision_hidden_size=config.vision_config.hidden_size,
+                text_hidden_size=config.text_config.hidden_size,
+                projector_hidden_act=config.projector_hidden_act,
+                multimodal_projector_bias=config.multimodal_projector_bias,
+            )
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.model.make_empty_intermediate_tensors
@@ -395,8 +414,6 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return image_features
 
     def _process_video_pixels(self, inputs: LlavaNextVideoPixelInputs):
-        assert self.vision_tower is not None
-
         video_pixels = inputs["pixel_values_videos"]
 
         if isinstance(video_pixels, torch.Tensor):
@@ -419,9 +436,6 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         return [e.flatten(0, 1) for e in embeds]
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         video_input = self._parse_and_validate_video_input(**kwargs)
         if video_input is None:
@@ -431,7 +445,7 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -465,3 +479,42 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             ignore_unexpected_prefixes=["image_newline"],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """
+        Get the module prefix in multimodal models
+        """
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector="multi_modal_projector",
+            tower_model="vision_tower",
+        )
+
+    def get_num_mm_encoder_tokens(
+        self,
+        num_video_tokens: int,
+    ) -> int:
+        # Invert the spatial pooling done by `vision_resampler`: each frame
+        # contributes `pooled_grid_length ** 2` tokens after the language
+        # model's placeholder count, but `patch_grid_length ** 2` tokens
+        # when it leaves the vision encoder.
+        pooled_tokens_per_frame = self.pooled_grid_length**2
+        if num_video_tokens <= 0 or pooled_tokens_per_frame <= 0:
+            return 0
+
+        num_frames = num_video_tokens // pooled_tokens_per_frame
+        return num_frames * (self.patch_grid_length**2)
+
+    def get_num_mm_connector_tokens(
+        self,
+        num_vision_tokens: int,
+    ) -> int:
+        # The projector is length-preserving; it runs after
+        # `vision_resampler` has already pooled each frame down to
+        # `pooled_grid_length ** 2` tokens.
+        patch_tokens_per_frame = self.patch_grid_length**2
+        if num_vision_tokens <= 0 or patch_tokens_per_frame <= 0:
+            return 0
+
+        num_frames = num_vision_tokens // patch_tokens_per_frame
+        return num_frames * (self.pooled_grid_length**2)

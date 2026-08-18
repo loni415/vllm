@@ -19,10 +19,10 @@ from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionCon
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -409,8 +409,8 @@ class KananaVProcessingInfo(BaseProcessingInfo):
             preprocessed_size = ImageSize(width=image_width, height=image_height)
 
         # NOTE: Frames are padded to be divisible by `temporal_patch_size`
-        # https://github.com/huggingface/transformers/blob/v4.48.3/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py#L294
-        padded_num_frames = num_frames + num_frames % temporal_patch_size
+        # https://github.com/huggingface/transformers/blob/v5.13.0/src/transformers/models/qwen2_vl/video_processing_qwen2_vl.py#L249-L252
+        padded_num_frames = num_frames + (-num_frames % temporal_patch_size)
 
         grid_t = max(padded_num_frames // temporal_patch_size, 1)
         grid_h = preprocessed_size.height // patch_size
@@ -444,7 +444,7 @@ class KananaVDummyInputsBuilder(BaseDummyInputsBuilder[KananaVProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
         return {
@@ -586,16 +586,21 @@ class KananaVForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP)
         config = vllm_config.model_config.hf_config
         self.config = config
 
-        self.vision_model = CustomQwen2VLVE._from_config(config.vision_config)
-        self.abstractor = DynamicCAbstractor(
-            config.projector_config, num_input_tokens=self.vision_model.get_num_tokens()
-        )
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "model"),
-            architectures=["LlamaForCausalLM"],
-        )
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_model = CustomQwen2VLVE._from_config(config.vision_config)
+            self.abstractor = DynamicCAbstractor(
+                config.projector_config,
+                num_input_tokens=self.vision_model.get_num_tokens(),
+            )
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "model"),
+                architectures=["LlamaForCausalLM"],
+            )
+
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
@@ -718,9 +723,6 @@ class KananaVForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP)
         visual_embeds = self.forward_projector(visual_features, image_metas=image_metas)
         return visual_embeds
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
@@ -730,7 +732,7 @@ class KananaVForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

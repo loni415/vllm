@@ -5,12 +5,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.fla.ops.layernorm_guard import (
+from vllm.platforms import current_platform
+from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     layer_norm_fwd,
     layernorm_fn,
     rms_norm_ref,
 )
 from vllm.utils.torch_utils import set_random_seed
+
+DEVICE = "xpu" if current_platform.is_xpu() else "cuda"
 
 
 def layer_norm_ref(
@@ -74,7 +77,7 @@ def layer_norm_ref(
     return out.to(dtype)
 
 
-DTYPES = [torch.bfloat16, torch.float32]
+DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 # Test various M sizes to ensure rows_per_block logic works correctly
 NUM_TOKENS = [
     1,
@@ -115,7 +118,7 @@ def test_layer_norm_fwd_basic(
 ) -> None:
     """Test basic layer norm forward pass without z (gate) tensor."""
     set_random_seed(seed)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
 
     # Create inputs
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -157,7 +160,7 @@ def test_layer_norm_fwd_with_gate(
 ) -> None:
     """Test layer norm forward pass with z (gate) tensor."""
     set_random_seed(42)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
 
     # Create inputs
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -214,7 +217,7 @@ def test_layer_norm_fwd_with_groups(
         )
 
     set_random_seed(42)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
 
     # Create inputs
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -254,7 +257,7 @@ def test_layer_norm_rows_per_block(
 ) -> None:
     """Test that rows_per_block logic works correctly for various M sizes."""
     set_random_seed(42)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
     hidden_size = 1024
 
     # Create inputs
@@ -279,7 +282,7 @@ def test_strided_input(dtype: torch.dtype) -> None:
     """Test that the kernel handles non-contiguous (strided)
     inputs correctly."""
     set_random_seed(42)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
     num_tokens = 128
     hidden_size = 1024
 
@@ -319,7 +322,7 @@ def test_output_buffer_provided(
 ) -> None:
     """Test that the kernel works when an output buffer is provided."""
     set_random_seed(42)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
 
     # Create inputs
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -360,7 +363,7 @@ def test_multidimensional_input(
 ) -> None:
     """Test that the autograd function handles multidimensional inputs."""
     set_random_seed(42)
-    device = torch.device("cuda:0")
+    device = torch.device(DEVICE)
     hidden_size = shape[-1]
 
     # Create inputs
@@ -377,6 +380,68 @@ def test_multidimensional_input(
 
     # Check outputs
     assert out.shape == x.shape
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 128, 1024])
+@pytest.mark.parametrize("hidden_size", [64, 256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("has_gate", [True, False])
+@pytest.mark.parametrize("group_size", [None, 64])
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+@torch.inference_mode()
+def test_rmsnorm_gated_forward_native_dtype(
+    default_vllm_config,
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    has_gate: bool,
+    group_size: int | None,
+    norm_before_gate: bool,
+):
+    """Test that RMSNormGated.forward_native preserves input dtype."""
+    if group_size is not None and hidden_size % group_size != 0:
+        pytest.skip(
+            f"hidden_size {hidden_size} not divisible by group_size {group_size}"
+        )
+
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+
+    device = torch.device(DEVICE)
+    set_random_seed(42)
+
+    layer = RMSNormGated(
+        hidden_size,
+        eps=1e-5,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        device=device,
+        dtype=dtype,
+    )
+
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    z = (
+        torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+        if has_gate
+        else None
+    )
+
+    out = layer.forward_native(x, z)
+
+    # Verify dtype preservation
+    assert out.dtype == dtype, f"Expected {dtype}, got {out.dtype}"
+
+    # Verify numerical correctness against reference
+    ref_out = rms_norm_ref(
+        x,
+        layer.weight,
+        layer.bias,
+        z=z,
+        eps=1e-5,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        upcast=True,
+    )
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 

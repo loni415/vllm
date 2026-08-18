@@ -4,6 +4,7 @@
 import pytest
 
 from vllm import LLM, SamplingParams
+from vllm.exceptions import VLLMValidationError
 
 MODEL = "hmellor/tiny-random-LlamaForCausalLM"
 PROMPT = "Hello my name is Robert and I"
@@ -144,20 +145,6 @@ def test_bad_words(llm):
     assert not contains_bad_word(new_text, new_tokens, bad_words_2)
 
 
-def test_logits_processor(llm):
-    """Check that we reject logits processor."""
-
-    # This sample logits processor gives infinite score to the i-th token,
-    # where i is the length of the input sequence.
-    # We therefore expect the output token sequence to be [0, 1, 2, ...]
-    def pick_ith(token_ids, logits):
-        logits[len(token_ids)] = float("inf")
-        return logits
-
-    with pytest.raises(ValueError):
-        _ = llm.generate(PROMPT, SamplingParams(logits_processors=[pick_ith]))
-
-
 def test_allowed_token_ids(llm):
     """Check that we can use allowed_token_ids."""
 
@@ -166,16 +153,24 @@ def test_allowed_token_ids(llm):
     output = llm.generate(PROMPT, SamplingParams(allowed_token_ids=allowed_token_ids))
     assert output[0].outputs[0].token_ids[-1] == TOKEN_ID
 
+    # Each single-token allowlist must force that token (kernel used to drop some).
+    for token_id in (1, 5, 100, 500, 2518, 9834, 31999):
+        output = llm.generate(
+            PROMPT,
+            SamplingParams(temperature=0, max_tokens=1, allowed_token_ids=[token_id]),
+        )
+        assert output[0].outputs[0].token_ids[-1] == token_id
+
     # Reject empty allowed_token_ids.
-    with pytest.raises(ValueError):
+    with pytest.raises(VLLMValidationError):
         _ = llm.generate(PROMPT, SamplingParams(allowed_token_ids=[]))
 
     # Reject negative token id.
-    with pytest.raises(ValueError):
+    with pytest.raises(VLLMValidationError):
         _ = llm.generate(PROMPT, SamplingParams(allowed_token_ids=[-1]))
 
     # Reject out of vocabulary.
-    with pytest.raises(ValueError):
+    with pytest.raises(VLLMValidationError):
         _ = llm.generate(PROMPT, SamplingParams(allowed_token_ids=[10000000]))
 
 

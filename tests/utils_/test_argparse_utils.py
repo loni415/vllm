@@ -4,6 +4,7 @@
 
 import json
 import os
+from argparse import BooleanOptionalAction
 
 import pytest
 import yaml
@@ -377,6 +378,71 @@ def test_load_config_file(tmp_path):
     # Assert that the processed arguments match the expected output
     assert processed_args == expected_args
     os.remove(str(config_file_path))
+
+
+def test_load_config_file_false_store_true_dropped(tmp_path):
+    """False values for store_true flags are silently dropped (correct)."""
+    config_data = {
+        "enable-feature": False,
+        "port": 8000,
+    }
+
+    config_file_path = tmp_path / "config.yaml"
+    with open(config_file_path, "w") as config_file:
+        yaml.dump(config_data, config_file)
+
+    parser = FlexibleArgumentParser()
+    parser.add_argument("--enable-feature", action=BooleanOptionalAction)
+    parser.add_argument("--port", type=int)
+
+    processed_args = parser.load_config_file(str(config_file_path))
+
+    assert "--enable-feature" not in processed_args
+    assert "--no-enable-feature" in processed_args
+
+
+def test_load_config_file_nested(tmp_path):
+    """Test that nested dicts in YAML config are converted to JSON strings."""
+    config_data = {
+        "port": 8000,
+        "compilation-config": {
+            "pass_config": {"fuse_allreduce_rms": True},
+        },
+    }
+    config_file_path = tmp_path / "nested_config.yaml"
+    with open(config_file_path, "w") as f:
+        yaml.dump(config_data, f)
+
+    parser = FlexibleArgumentParser()
+    processed_args = parser.load_config_file(str(config_file_path))
+
+    assert processed_args[processed_args.index("--port") + 1] == "8000"
+    cc_value = json.loads(
+        processed_args[processed_args.index("--compilation-config") + 1]
+    )
+    assert cc_value == {"pass_config": {"fuse_allreduce_rms": True}}
+
+
+def test_nested_config_end_to_end(tmp_path):
+    """Test end-to-end parsing of nested configs in YAML files."""
+    config_data = {
+        "compilation-config": {
+            "mode": 3,
+            "pass_config": {"fuse_allreduce_rms": True},
+        },
+    }
+    config_file_path = tmp_path / "nested_config.yaml"
+    with open(config_file_path, "w") as f:
+        yaml.dump(config_data, f)
+
+    parser = FlexibleArgumentParser()
+    parser.add_argument("-cc", "--compilation-config", type=json.loads)
+    args = parser.parse_args(["--config", str(config_file_path)])
+
+    assert args.compilation_config == {
+        "mode": 3,
+        "pass_config": {"fuse_allreduce_rms": True},
+    }
 
 
 def test_compilation_mode_string_values(parser):

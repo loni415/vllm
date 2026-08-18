@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import safetensors
+import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -50,6 +51,8 @@ class ECExampleConnector(ECConnectorBase):
         super().__init__(vllm_config=vllm_config, role=role)
         # req_id -> index
         self._mm_datas_need_loads: dict[str, int] = {}
+        self._model_config = vllm_config.model_config
+        self._metadata_fields_cache: dict[str, set[str]] = {}
         transfer_config = vllm_config.ec_transfer_config
         if transfer_config is not None:
             self._storage_path = transfer_config.get_from_extra_config(
@@ -117,23 +120,20 @@ class ECExampleConnector(ECConnectorBase):
         safetensors.torch.save_file(tensors, filename)
         logger.debug("Save cache successful for mm_hash %s", mm_hash)
 
-    def has_caches(
+    def has_cache_item(
         self,
-        request: "Request",
-    ) -> list[bool]:
+        identifier: str,
+    ) -> bool:
         """
-        Check if cache exist externally for each mm_data of request
+        Check if cache exist externally for the media
 
         Args:
-            request (Request): the request object.
+            identifier (str): the identifier of the media.
 
         Returns:
-            List of bool indicate that ith mm_data exist in cache or not
+            Bool indicate that media exists in cache or not
         """
-        result = []
-        for feature in request.mm_features:
-            result.append(self._found_match_for_mm_data(feature.identifier))
-        return result
+        return self._found_match_for_mm_data(identifier)
 
     def update_state_after_alloc(
         self,
@@ -144,8 +144,10 @@ class ECExampleConnector(ECConnectorBase):
         Update ECConnector state after encoder cache allocation.
         """
         mm_hash = request.mm_features[index].identifier
+        # Only load cache if it is consumer and cache exists
+        if not self.is_consumer or not self.has_cache_item(mm_hash):
+            return
         num_encoder_token = request.get_num_encoder_embeds(index)
-        # Insert mm_hash only if this block has not been recorded yet.
         self._mm_datas_need_loads[mm_hash] = num_encoder_token
 
     def build_connector_meta(
@@ -165,6 +167,70 @@ class ECExampleConnector(ECConnectorBase):
             meta.add_mm_data(MMMeta.make_meta(mm_hash, num_encoder_token))
         self._mm_datas_need_loads.clear()
         return meta
+
+    def _placeholder_metadata_fields(self, modality: str) -> set[str]:
+        """Which processed keys this model needs published for `modality`.
+
+        Read from `MultiModalDataParser.embedding_fields`, the same declaration
+        the consumer's parser requires, so the two cannot drift. An empty set
+        means the modality cannot be delivered out of band, and the consumer
+        will process the media itself.
+        """
+        if modality in self._metadata_fields_cache:
+            return self._metadata_fields_cache[modality]
+
+        fields: set[str] = set()
+        try:
+            from vllm.multimodal import MULTIMODAL_REGISTRY
+
+            info = MULTIMODAL_REGISTRY.create_processor(self._model_config).info
+            fields = info.data_parser.placeholder_metadata_fields(modality)
+        except Exception:
+            # Reporting nothing is a safe degradation: the consumer falls back to
+            # processing the media itself.
+            logger.warning(
+                "Could not determine the placeholder metadata fields for "
+                "modality %s; the consumer will preprocess the media itself.",
+                modality,
+                exc_info=True,
+            )
+
+        self._metadata_fields_cache[modality] = fields
+        return fields
+
+    def request_finished(
+        self,
+        request: "Request",
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Report each item's cache key and grid so a consumer can skip the
+        image transform.
+
+        A consumer only needs the grid to size the prompt's placeholder range;
+        the embedding itself arrives through this connector. Reporting the grid
+        the producer actually computed keeps the two sides in agreement without
+        the caller re-deriving it from the raw media.
+        """
+        if not self.is_producer:
+            return False, None
+
+        items = []
+        for feature in request.mm_features:
+            metadata = {}
+            # `data` is None for items served from the processor cache, in which
+            # case the metadata is unavailable here and the consumer has to fall
+            # back to processing the media itself.
+            if feature.data is not None:
+                wanted = self._placeholder_metadata_fields(feature.modality)
+                metadata = {
+                    key: value.tolist()
+                    for key, value in feature.data.get_data().items()
+                    if key in wanted and isinstance(value, torch.Tensor)
+                }
+            items.append({"mm_hash": feature.identifier, **metadata})
+
+        if not items:
+            return False, None
+        return False, {"ec_items": items}
 
     # ==============================
     # Helper functions

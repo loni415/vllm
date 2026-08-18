@@ -4,17 +4,18 @@ set -ex
 # usage: ./install_python_libraries.sh [options]
 #   --workspace <dir>    workspace directory (default: ./ep_kernels_workspace)
 #   --mode <mode>        "install" (default) or "wheel"
-#   --pplx-ref <commit>  pplx-kernels commit hash
 #   --deepep-ref <commit> DeepEP commit hash
 #   --nvshmem-ver <ver>  NVSHMEM version 
 
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
-PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}
-DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"73b6ea4"}
+# Pinned in full: an abbreviated hash is not a ref, so a consumer that
+# fetches the pin directly ("git fetch origin <sha>") cannot resolve it.
+DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb"}
+
 NVSHMEM_VER=${NVSHMEM_VER:-"3.3.24"}  # Default supports both CUDA 12 and 13
 WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
 MODE=${MODE:-install}
-CUDA_VERSION_MAJOR=$(${CUDA_HOME}/bin/nvcc --version | egrep -o "release [0-9]+" | cut -d ' ' -f 2)
+CUDA_VERSION_MAJOR=$("${CUDA_HOME}"/bin/nvcc --version | grep -E -o "release [0-9]+" | cut -d ' ' -f 2)
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -33,14 +34,6 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             MODE="$2"
-            shift 2
-            ;;
-        --pplx-ref)
-            if [[ -z "$2" || "$2" =~ ^- ]]; then
-                echo "Error: --pplx-ref requires an argument." >&2
-                exit 1
-            fi
-            PPLX_COMMIT_HASH="$2"
             shift 2
             ;;
         --deepep-ref)
@@ -111,8 +104,9 @@ NVSHMEM_URL="https://developer.download.nvidia.com/compute/nvshmem/redist/libnvs
 
 pushd "$WORKSPACE"
 echo "Downloading NVSHMEM ${NVSHMEM_VER} for ${NVSHMEM_SUBDIR} ..."
-curl -fSL "${NVSHMEM_URL}" -o "${NVSHMEM_FILE}"
+curl -fSL --retry 3 --retry-delay 2 "${NVSHMEM_URL}" -o "${NVSHMEM_FILE}"
 tar -xf "${NVSHMEM_FILE}"
+rm -rf nvshmem
 mv "${NVSHMEM_FILE%.tar.xz}" nvshmem
 rm -f "${NVSHMEM_FILE}"
 rm -rf nvshmem/lib/bin nvshmem/lib/share
@@ -178,6 +172,48 @@ do_build() {
         sed -i "s|f'{nvshmem_dir}/include']|f'{nvshmem_dir}/include', '${CUDA_HOME}/include/cccl']|" "setup.py"
     fi
 
+    # DeepEPv2 requires Linux 5.6+ at runtime for pidfd_getfd (pidfd_open was
+    # added in Linux 5.3), but manylinux headers predate both definitions.
+    # DeepEP is built as a separate wheel for the vLLM container image and is
+    # not included in the vLLM wheel, so this does not change its manylinux ABI.
+    if [[ "$name" == "DeepEP" ]] && \
+        ! grep -q "vLLM manylinux syscall compatibility" \
+            csrc/kernels/backend/symmetric.hpp; then
+        sed -i '1i\
+// vLLM manylinux syscall compatibility\
+#if defined(__x86_64__) || defined(__aarch64__)\
+#ifndef SYS_pidfd_open\
+#ifdef __NR_pidfd_open\
+#define SYS_pidfd_open __NR_pidfd_open\
+#else\
+#define SYS_pidfd_open 434\
+#endif\
+#endif\
+#ifndef SYS_pidfd_getfd\
+#ifdef __NR_pidfd_getfd\
+#define SYS_pidfd_getfd __NR_pidfd_getfd\
+#else\
+#define SYS_pidfd_getfd 438\
+#endif\
+#endif\
+#endif' csrc/kernels/backend/symmetric.hpp
+    fi
+
+    if [[ "$name" == "DeepEP" ]]; then
+        # DeepEP links against the CUDA driver API in driverless build images.
+        local cuda_driver_stub
+        local cuda_driver_stub_dir
+        cuda_driver_stub=$(
+            find -H "$CUDA_HOME" -path "*/stubs/libcuda.so" -print -quit
+        )
+        if [[ -z "$cuda_driver_stub" ]]; then
+            echo "CUDA driver stub not found under $CUDA_HOME" >&2
+            exit 1
+        fi
+        cuda_driver_stub_dir=$(dirname "$cuda_driver_stub")
+        export LIBRARY_PATH="${cuda_driver_stub_dir}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    fi
+
     if [ "$MODE" = "install" ]; then
         echo "Installing $name into environment"
         eval "$extra_env" uv pip install --no-build-isolation -vvv .
@@ -187,14 +223,6 @@ do_build() {
     fi
     popd
 }
-
-# build pplx-kernels
-do_build \
-    "https://github.com/ppl-ai/pplx-kernels" \
-    "pplx-kernels" \
-    "setup.py" \
-    "$PPLX_COMMIT_HASH" \
-    ""
 
 # build DeepEP
 do_build \

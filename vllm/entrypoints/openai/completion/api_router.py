@@ -13,12 +13,12 @@ from vllm.entrypoints.openai.completion.protocol import (
 )
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
-from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.utils import (
+from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
+    validate_json_request,
     with_cancellation,
 )
+from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -49,15 +49,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     )
     handler = completion(raw_request)
     if handler is None:
-        base_server = raw_request.app.state.openai_serving_tokenization
-        return base_server.create_error_response(
-            message="The model does not support Completions API"
-        )
+        raise NotImplementedError("The model does not support Completions API")
 
-    try:
-        generator = await handler.create_completion(request, raw_request)
-    except Exception as e:
-        return handler.create_error_response(e)
+    generator = await handler.create_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(

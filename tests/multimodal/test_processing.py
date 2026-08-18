@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from vllm.config import ModelConfig
+from vllm.exceptions import VLLMValidationError
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.processing.context import InputProcessingContext
 from vllm.multimodal.processing.processor import (
@@ -901,40 +902,6 @@ def test_find_mm_placeholders(
 
 @pytest.mark.parametrize("model_id", ["llava-hf/llava-v1.6-mistral-7b-hf"])
 @pytest.mark.parametrize(
-    ("limit", "num_supported", "is_valid"),
-    [
-        (0, 0, True),
-        (0, 1, True),
-        (1, 0, False),
-        (1, 1, True),
-        (1, 2, True),
-        (2, 1, False),
-        (2, 2, True),
-    ],
-)
-def test_limit_mm_per_prompt_dummy(model_id, limit, num_supported, is_valid):
-    limit_mm_per_prompt = {"image": limit}
-
-    model_config = ModelConfig(
-        model=model_id,
-        limit_mm_per_prompt=limit_mm_per_prompt,
-    )
-
-    processor = MULTIMODAL_REGISTRY.create_processor(model_config)
-    processor._supported_mm_limits = {"image": num_supported}
-
-    exc_ctx = nullcontext() if is_valid else pytest.raises(ValueError, match="At most")
-
-    with exc_ctx:
-        MULTIMODAL_REGISTRY.get_dummy_mm_inputs(
-            model_config,
-            mm_counts=limit_mm_per_prompt,
-            processor=processor,
-        )
-
-
-@pytest.mark.parametrize("model_id", ["llava-hf/llava-v1.6-mistral-7b-hf"])
-@pytest.mark.parametrize(
     ("num_images", "limit", "is_valid"),
     [
         (0, 0, True),
@@ -965,14 +932,62 @@ def test_limit_mm_per_prompt_apply(model_id, num_images, limit, is_valid):
     else:
         mm_data = {"image": [image] * num_images}
 
-    exc_ctx = nullcontext() if is_valid else pytest.raises(ValueError, match="At most")
+    exc_ctx = (
+        nullcontext()
+        if is_valid
+        else pytest.raises(VLLMValidationError, match="At most")
+    )
 
     with exc_ctx:
-        processor.apply(
+        processor(
             "<image>" * num_images,
-            mm_data=mm_data,
+            mm_items=processor.info.parse_mm_data(mm_data),
             hf_processor_mm_kwargs={},
         )
+
+
+@pytest.mark.parametrize("model_id", ["llava-hf/llava-v1.6-mistral-7b-hf"])
+@pytest.mark.parametrize(
+    ("user_limit", "supported_limit"),
+    [
+        (0, 0),
+        (0, 1),
+        (1, 0),  # user wants 1, model supports 0 → capped to 0
+        (1, 1),
+        (1, 2),
+        (2, 1),  # user wants 2, model supports 1 → capped to 1
+        (2, 2),
+        (5, 1),  # large user limit, low model support → capped to 1
+        (1, 5),
+        (10, 0),  # large user limit, no model support → capped to 0
+    ],
+)
+def test_budget_caps_prevent_dummy_input_validation_failure(
+    model_id, user_limit, supported_limit
+):
+    limit_mm_per_prompt = {"image": user_limit}
+
+    model_config = ModelConfig(
+        model=model_id,
+        limit_mm_per_prompt=limit_mm_per_prompt,
+    )
+
+    processor = MULTIMODAL_REGISTRY.create_processor(model_config)
+    processor.info.get_supported_mm_limits = lambda: {"image": supported_limit}
+
+    # This is what budget.py uses to derive mm_counts
+    allowed = processor.info.allowed_mm_limits
+
+    assert allowed["image"] <= supported_limit, (
+        f"allowed_mm_limits['image']={allowed['image']} exceeds "
+        f"supported_limit={supported_limit}"
+    )
+
+    assert allowed["image"] <= user_limit, (
+        f"allowed_mm_limits['image']={allowed['image']} exceeds user_limit={user_limit}"
+    )
+
+    assert allowed["image"] == min(user_limit, supported_limit)
 
 
 class DummyProcessor:
@@ -1082,3 +1097,96 @@ def test_apply_matches_no_match_exits_quickly():
     # Should complete in < 100ms (was taking seconds before the fix)
     assert elapsed < 0.1, f"_apply_matches took {elapsed:.2f}s, expected < 0.1s"
     assert "".join(result) == long_prompt
+
+
+def test_apply_matches_many_shared_targets_scales_linearly():
+    """Shared replacement targets must not trigger per-item rescanning."""
+    replacement = [1] * 50
+    update = PromptReplacement("image", [0], replacement)
+
+    def measure(item_count: int) -> float:
+        mm_prompt_updates = {
+            "image": [[update.resolve(item_idx)] for item_idx in range(item_count)]
+        }
+        prompt = [0] * item_count
+
+        start = time.perf_counter()
+        result, match_result = apply_token_matches(
+            prompt,
+            mm_prompt_updates,
+            tokenizer=None,
+        )
+        elapsed = time.perf_counter() - start
+
+        assert len(result) == item_count * len(replacement)
+        assert all(token_id == 1 for token_id in result)
+        assert match_result == {"image": [0] * item_count}
+
+        return elapsed
+
+    measure(100)
+    small_time = measure(1_000)
+    large_time = measure(4_000)
+
+    time_ratio = large_time / small_time
+    assert time_ratio < 8, f"Expected linear scaling, got {time_ratio:.1f}x"
+
+
+def test_iter_token_matches_rejects_negative_start_idx():
+    with pytest.raises(ValueError, match="non-negative"):
+        list(iter_token_matches([1, 2, 3], [2], start_idx=-1))
+
+
+def test_find_mm_placeholders_avoids_quadratic_false_prefixes():
+    """
+    Test that placeholder scanning stays linear under adversarial candidates.
+
+    The fast-forward scan must not rescan the prompt tail per position when
+    one candidate's first token never occurs (forcing a full search) while
+    another's occurs at every position (forcing single-step advances).
+    """
+    prompt = [1] * 30_000
+    mm_prompt_updates = {
+        "absent": [[PromptReplacement("absent", [0], [999, 0]).resolve(0)]],
+        "frequent_false_prefix": [
+            [PromptReplacement("frequent_false_prefix", [0], [1, 2]).resolve(0)]
+        ],
+    }
+
+    start = time.perf_counter()
+    result = find_mm_placeholders(prompt, mm_prompt_updates, tokenizer=None)
+    elapsed = time.perf_counter() - start
+
+    assert result == {}
+    assert elapsed < 0.5, f"find_mm_placeholders took {elapsed:.2f}s, expected < 0.5s"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        # Empty prompt: the scan loop is never entered
+        [],
+        # Non-empty prompt: the scan runs but never finds the first item,
+        # so the second item must stay unresolved
+        [1, 2, 3, 4, 5],
+    ],
+)
+def test_find_mm_placeholders_resolves_content_lazily(prompt):
+    """
+    Test that content of items the scan never reaches is not resolved.
+
+    With `tokenizer=None`, resolving string content raises; the scan must
+    return no placeholders instead of raising on the second item.
+    """
+    result = find_mm_placeholders(
+        prompt,
+        {
+            "image": [
+                [PromptReplacement("image", [0], [999]).resolve(0)],
+                [PromptReplacement("image", [0], "never reached").resolve(1)],
+            ]
+        },
+        tokenizer=None,
+    )
+
+    assert result == {}
